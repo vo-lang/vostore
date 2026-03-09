@@ -1,0 +1,950 @@
+// B-tree core operations: search, insert, delete, split, merge.
+//
+// This is a B+tree variant where:
+//   - Leaf nodes store key-value pairs
+//   - Interior nodes store keys and child page pointers
+//   - All values live in leaf nodes
+//   - Leaves are linked via rightChild for ordered iteration
+//
+// The tree order is determined dynamically by page capacity.
+// Splits occur when a page cannot fit a new cell.
+// Merges occur when a page drops below minimum occupancy after deletion.
+//
+// Minimum occupancy: a non-root node must have at least 2 cells.
+// Root may have as few as 1 cell (or 0 if tree is empty).
+package vostore
+
+import (
+	"encoding/binary"
+	"errors"
+	"fmt"
+)
+
+type btree struct {
+	pager *pager
+}
+
+type searchResult struct {
+	found bool
+	value []byte
+	page  uint32
+	index int
+}
+
+type mutResult struct {
+	newPageID uint32
+	split     bool
+	splitKey  []byte
+	rightPage uint32
+}
+
+type deleteResult struct {
+	found     bool
+	newPageID uint32
+}
+
+func compareBytes(a, b []byte) int {
+	minLen := len(a)
+	if len(b) < minLen {
+		minLen = len(b)
+	}
+	for i := 0; i < minLen; i++ {
+		if a[i] < b[i] {
+			return -1
+		}
+		if a[i] > b[i] {
+			return 1
+		}
+	}
+	if len(a) < len(b) {
+		return -1
+	}
+	if len(a) > len(b) {
+		return 1
+	}
+	return 0
+}
+
+func hasPrefix(data, prefix []byte) bool {
+	if len(data) < len(prefix) {
+		return false
+	}
+	return compareBytes(data[:len(prefix)], prefix) == 0
+}
+
+const maxKeySize = 4000
+
+func inlineLeafCellSize(keyLen, valueLen int) int {
+	return leafCellOverhead + keyLen + valueLen
+}
+
+func overflowLeafCellSize(keyLen int) int {
+	return leafCellOverhead + keyLen + 4
+}
+
+func leafCellFitsInPage(cellSize int) bool {
+	return pageHeaderSize+cellOffsetSize+cellSize <= pageSize
+}
+
+func ensureNodePageType(pg page) error {
+	if pg.pageType != pageTypeLeaf && pg.pageType != pageTypeInterior {
+		return errors.New("vostore: corrupt btree: invalid node page type")
+	}
+	return nil
+}
+
+func visitNode(seen map[uint32]bool, id uint32) error {
+	if seen[id] {
+		return errors.New("vostore: corrupt btree: cycle detected")
+	}
+	seen[id] = true
+	return nil
+}
+
+func (t *btree) search(key []byte) (searchResult, error) {
+	rootPage := t.pager.currentRootPage()
+	if rootPage == 0 {
+		return searchResult{}, nil
+	}
+	return t.searchInPage(rootPage, key, make(map[uint32]bool))
+}
+
+func (t *btree) searchInPage(id uint32, key []byte, seen map[uint32]bool) (searchResult, error) {
+	visitNode(seen, id)?
+	pg := t.pager.readPage(id)?
+	ensureNodePageType(pg)?
+	if pg.pageType == pageTypeLeaf {
+		idx, found := t.findInLeaf(pg, key)
+		if found {
+			val := t.readCellValue(pg.cells[idx])?
+			return searchResult{found: true, value: val, page: id, index: idx}, nil
+		}
+		return searchResult{found: false, page: id, index: idx}, nil
+	}
+
+	childID := t.findChild(pg, key)
+	return t.searchInPage(childID, key, seen)
+}
+
+func (t *btree) findInLeaf(pg page, key []byte) (int, bool) {
+	lo := 0
+	hi := int(pg.cellCount)
+	for lo < hi {
+		mid := lo + (hi-lo)/2
+		cmp := compareBytes(key, pg.cells[mid].key)
+		if cmp == 0 {
+			return mid, true
+		}
+		if cmp < 0 {
+			hi = mid
+		} else {
+			lo = mid + 1
+		}
+	}
+	return lo, false
+}
+
+func (t *btree) findChild(pg page, key []byte) uint32 {
+	lo, hi := 0, int(pg.cellCount)
+	for lo < hi {
+		mid := lo + (hi-lo)/2
+		if compareBytes(key, pg.cells[mid].key) < 0 {
+			hi = mid
+		} else {
+			lo = mid + 1
+		}
+	}
+	if lo < int(pg.cellCount) {
+		return pg.cells[lo].childPage
+	}
+	return pg.rightChild
+}
+
+func (t *btree) findChildIdx(pg page, key []byte) (int, uint32) {
+	lo, hi := 0, int(pg.cellCount)
+	for lo < hi {
+		mid := lo + (hi-lo)/2
+		if compareBytes(key, pg.cells[mid].key) < 0 {
+			hi = mid
+		} else {
+			lo = mid + 1
+		}
+	}
+	if lo < int(pg.cellCount) {
+		return lo, pg.cells[lo].childPage
+	}
+	return int(pg.cellCount), pg.rightChild
+}
+
+func (t *btree) readCellValue(c cell) ([]byte, error) {
+	if c.overflowID == 0 {
+		return cloneBytes(c.value), nil
+	}
+	return t.readOverflow(c.overflowID)
+}
+
+func (t *btree) readOverflow(startPage uint32) ([]byte, error) {
+	var result []byte
+	pgID := startPage
+	seen := make(map[uint32]bool)
+	for pgID != 0 {
+		if seen[pgID] {
+			return nil, errors.New("vostore: corrupt overflow chain: cycle detected")
+		}
+		seen[pgID] = true
+		rawBuf := t.pager.readRawPage(pgID)?
+		if rawBuf[0] != pageTypeOverflow {
+			return nil, errors.New("vostore: corrupt overflow page: invalid page type")
+		}
+		nextPage := binary.LittleEndian.Uint32(rawBuf[4:8])
+		dataLen := int(binary.LittleEndian.Uint16(rawBuf[8:10]))
+		if 10+dataLen > pageSize {
+			return nil, errors.New("vostore: corrupt overflow page: dataLen exceeds page")
+		}
+		result = append(result, rawBuf[10:10+dataLen]...)
+		pgID = nextPage
+	}
+	return result, nil
+}
+
+func (t *btree) freeOverflow(startPage uint32) error {
+	pgID := startPage
+	seen := make(map[uint32]bool)
+	for pgID != 0 {
+		if seen[pgID] {
+			return errors.New("vostore: corrupt overflow chain: cycle detected")
+		}
+		seen[pgID] = true
+		rawBuf := t.pager.readRawPage(pgID)?
+		if rawBuf[0] != pageTypeOverflow {
+			return errors.New("vostore: corrupt overflow page: invalid page type")
+		}
+		nextPage := binary.LittleEndian.Uint32(rawBuf[4:8])
+		t.pager.retirePage(pgID)?
+		pgID = nextPage
+	}
+	return nil
+}
+
+func (t *btree) writeOverflow(value []byte) (uint32, error) {
+	maxData := pageSize - 10
+	needed := 0
+	remaining := len(value)
+	for remaining > 0 {
+		needed++
+		remaining -= maxData
+		if remaining < 0 {
+			remaining = 0
+		}
+	}
+	pageIDs := make([]uint32, needed)
+	for i := 0; i < needed; i++ {
+		pageIDs[i] = t.pager.allocPageID()?
+	}
+	offset := 0
+	for i := 0; i < needed; i++ {
+		end := offset + maxData
+		if end > len(value) {
+			end = len(value)
+		}
+		chunk := value[offset:end]
+
+		buf := make([]byte, pageSize)
+		buf[0] = pageTypeOverflow
+		if i+1 < needed {
+			binary.LittleEndian.PutUint32(buf[4:8], pageIDs[i+1])
+		}
+		binary.LittleEndian.PutUint16(buf[8:10], uint16(len(chunk)))
+		copy(buf[10:], chunk)
+		t.pager.writeRawPage(pageIDs[i], buf)?
+		offset = end
+	}
+	return pageIDs[0], nil
+}
+
+func (t *btree) insert(key, value []byte) error {
+	if len(key) == 0 {
+		return errors.New("vostore: key must not be empty")
+	}
+	if len(key) > maxKeySize {
+		return errors.New("vostore: key too large")
+	}
+	rootPage := t.pager.currentRootPage()
+	if rootPage == 0 {
+		root := t.pager.allocPage(pageTypeLeaf)?
+		root.cells = []cell{t.makeLeafCell(key, value)?}
+		root.cellCount = 1
+		t.pager.writePage(root)?
+		return t.pager.setCurrentRootPage(root.id)
+	}
+	result := t.insertInPage(rootPage, key, value)?
+	if result.split {
+		newRoot := t.pager.allocPage(pageTypeInterior)?
+		newRoot.cells = []cell{{
+			childPage: result.newPageID,
+			key:       result.splitKey,
+		}}
+		newRoot.cellCount = 1
+		newRoot.rightChild = result.rightPage
+		t.pager.writePage(newRoot)?
+		return t.pager.setCurrentRootPage(newRoot.id)
+	}
+	return t.pager.setCurrentRootPage(result.newPageID)
+}
+
+func (t *btree) insertInPage(id uint32, key, value []byte) (mutResult, error) {
+	return t.insertInPageSeen(id, key, value, make(map[uint32]bool))
+}
+
+func (t *btree) insertInPageSeen(id uint32, key, value []byte, seen map[uint32]bool) (mutResult, error) {
+	visitNode(seen, id)?
+	pg := t.pager.readPage(id)?
+	ensureNodePageType(pg)?
+	if pg.pageType == pageTypeLeaf {
+		return t.insertInLeaf(pg, key, value)
+	}
+	childIdx, childID := t.findChildIdx(pg, key)
+	child := t.insertInPageSeen(childID, key, value, seen)?
+	newPg := t.pager.cowPage(id)?
+	if child.split {
+		return t.insertInInterior(newPg, childIdx, child)
+	}
+	if childIdx < int(newPg.cellCount) {
+		newPg.cells[childIdx].childPage = child.newPageID
+	} else {
+		newPg.rightChild = child.newPageID
+	}
+	newPg.cellCount = uint16(len(newPg.cells))
+	t.pager.writePage(newPg)?
+	return mutResult{newPageID: newPg.id}, nil
+}
+
+func (t *btree) insertInLeaf(pg page, key, value []byte) (mutResult, error) {
+	newPg := t.pager.cowPage(pg.id)?
+	idx, found := t.findInLeaf(newPg, key)
+	if found && newPg.cells[idx].overflowID != 0 {
+		t.freeOverflow(newPg.cells[idx].overflowID)?
+	}
+	newCell := t.makeLeafCell(key, value)?
+	if found {
+		newPg.cells[idx] = newCell
+	} else {
+		newPg.cells = insertCellAt(newPg.cells, idx, newCell)
+	}
+	newPg.cellCount = uint16(len(newPg.cells))
+	if pageUsedSpace(newPg) <= pageSize {
+		t.pager.writePage(newPg)?
+		return mutResult{newPageID: newPg.id}, nil
+	}
+	return t.splitLeaf(newPg)
+}
+
+func (t *btree) insertInInterior(pg page, childIdx int, child mutResult) (mutResult, error) {
+	newCell := cell{
+		childPage: child.newPageID,
+		key:       child.splitKey,
+	}
+	if childIdx < int(pg.cellCount) {
+		pg.cells[childIdx].childPage = child.rightPage
+		pg.cells = insertCellAt(pg.cells, childIdx, newCell)
+	} else {
+		pg.cells = append(pg.cells, newCell)
+		pg.rightChild = child.rightPage
+	}
+	pg.cellCount = uint16(len(pg.cells))
+	if pageUsedSpace(pg) <= pageSize {
+		t.pager.writePage(pg)?
+		return mutResult{newPageID: pg.id}, nil
+	}
+	return t.splitInterior(pg)
+}
+
+func (t *btree) splitLeaf(pg page) (mutResult, error) {
+	cells, err := t.makeLeafSplittable(pg.cells)
+	if err != nil {
+		return mutResult{}, err
+	}
+	splitIdx, found := bestLeafSplit(cells)
+	if !found {
+		return mutResult{}, errors.New(fmt.Sprintf("vostore: cannot split leaf page: id=%d used=%d cells=%d sizes=%v", pg.id, pageUsedSpace(page{pageType: pageTypeLeaf, cellCount: uint16(len(cells)), cells: cells}), len(cells), leafCellSizes(cells)))
+	}
+	rightPg := t.pager.allocPage(pageTypeLeaf)?
+	rightPg.cells = cloneCells(cells[splitIdx:])
+	rightPg.cellCount = uint16(len(rightPg.cells))
+	pg.cells = cloneCells(cells[:splitIdx])
+	pg.cellCount = uint16(len(pg.cells))
+	t.pager.writePage(pg)?
+	t.pager.writePage(rightPg)?
+	splitKey := cloneBytes(rightPg.cells[0].key)
+	return mutResult{
+		newPageID: pg.id,
+		split:     true,
+		splitKey:  splitKey,
+		rightPage: rightPg.id,
+	}, nil
+}
+
+func (t *btree) splitInterior(pg page) (mutResult, error) {
+	children := interiorChildPages(pg)
+	splitIdx, found, err := t.bestInteriorSplit(children)
+	if err != nil {
+		return mutResult{}, err
+	}
+	if !found {
+		return mutResult{}, errors.New("vostore: cannot split interior page")
+	}
+	leftChildren := children[:splitIdx]
+	rightChildren := children[splitIdx:]
+	splitKey := t.firstKeyInPage(rightChildren[0])?
+	rightPg := t.pager.allocPage(pageTypeInterior)?
+	t.rebuildInteriorPage(&pg, leftChildren)?
+	t.rebuildInteriorPage(&rightPg, rightChildren)?
+	t.pager.writePage(pg)?
+	t.pager.writePage(rightPg)?
+	return mutResult{
+		newPageID: pg.id,
+		split:     true,
+		splitKey:  splitKey,
+		rightPage: rightPg.id,
+	}, nil
+}
+
+func (t *btree) delete(key []byte) (bool, error) {
+	rootPage := t.pager.currentRootPage()
+	if rootPage == 0 {
+		return false, nil
+	}
+	result := t.deleteInPage(rootPage, key)?
+	if !result.found {
+		return false, nil
+	}
+	if result.newPageID == 0 {
+		t.pager.setCurrentRootPage(0)?
+		return true, nil
+	}
+	root := t.pager.readPage(result.newPageID)?
+	if root.pageType == pageTypeInterior && root.cellCount == 0 {
+		t.pager.retirePage(root.id)?
+		t.pager.setCurrentRootPage(root.rightChild)?
+		return true, nil
+	}
+	if root.pageType == pageTypeLeaf && root.cellCount == 0 {
+		t.pager.retirePage(root.id)?
+		t.pager.setCurrentRootPage(0)?
+		return true, nil
+	}
+	return true, t.pager.setCurrentRootPage(result.newPageID)
+}
+
+func (t *btree) deleteInPage(id uint32, key []byte) (deleteResult, error) {
+	return t.deleteInPageSeen(id, key, make(map[uint32]bool))
+}
+
+func (t *btree) deleteInPageSeen(id uint32, key []byte, seen map[uint32]bool) (deleteResult, error) {
+	visitNode(seen, id)?
+	pg := t.pager.readPage(id)?
+	ensureNodePageType(pg)?
+	if pg.pageType == pageTypeLeaf {
+		return t.deleteFromLeaf(pg, key)
+	}
+	childIdx, childID := t.findChildIdx(pg, key)
+	child := t.deleteInPageSeen(childID, key, seen)?
+	if !child.found {
+		return child, nil
+	}
+	newPg := t.pager.cowPage(id)?
+	children := interiorChildPages(newPg)
+	if child.newPageID == 0 {
+		children = removeChildPageAt(children, childIdx)
+	} else {
+		children[childIdx] = child.newPageID
+		children = t.rebalanceChildAt(children, childIdx)?
+	}
+	if len(children) == 0 {
+		t.pager.retirePage(newPg.id)?
+		return deleteResult{found: true, newPageID: 0}, nil
+	}
+	if len(children) == 1 {
+		t.pager.retirePage(newPg.id)?
+		return deleteResult{found: true, newPageID: children[0]}, nil
+	}
+	t.rebuildInteriorPage(&newPg, children)?
+	t.pager.writePage(newPg)?
+	return deleteResult{found: true, newPageID: newPg.id}, nil
+}
+
+func (t *btree) deleteFromLeaf(pg page, key []byte) (deleteResult, error) {
+	idx, found := t.findInLeaf(pg, key)
+	if !found {
+		return deleteResult{found: false, newPageID: pg.id}, nil
+	}
+	newPg := t.pager.cowPage(pg.id)?
+	if newPg.cells[idx].overflowID != 0 {
+		t.freeOverflow(newPg.cells[idx].overflowID)?
+	}
+	newPg.cells = removeCellAt(newPg.cells, idx)
+	newPg.cellCount = uint16(len(newPg.cells))
+	if newPg.cellCount == 0 {
+		t.pager.retirePage(newPg.id)?
+		return deleteResult{found: true, newPageID: 0}, nil
+	}
+	t.pager.writePage(newPg)?
+	return deleteResult{found: true, newPageID: newPg.id}, nil
+}
+
+func (t *btree) keysWithPrefix(prefix []byte) ([]string, error) {
+	rootPage := t.pager.currentRootPage()
+	if rootPage == 0 {
+		return nil, nil
+	}
+	return t.collectKeys(rootPage, prefix)
+}
+
+func (t *btree) allKeys() ([]string, error) {
+	rootPage := t.pager.currentRootPage()
+	if rootPage == 0 {
+		return nil, nil
+	}
+	return t.collectKeys(rootPage, nil)
+}
+
+func (t *btree) count() (int, error) {
+	rootPage := t.pager.currentRootPage()
+	if rootPage == 0 {
+		return 0, nil
+	}
+	return t.countInPage(rootPage)
+}
+
+func (t *btree) collectKeys(id uint32, prefix []byte) ([]string, error) {
+	return t.collectKeysSeen(id, prefix, make(map[uint32]bool))
+}
+
+func (t *btree) collectKeysSeen(id uint32, prefix []byte, seen map[uint32]bool) ([]string, error) {
+	visitNode(seen, id)?
+	pg := t.pager.readPage(id)?
+	ensureNodePageType(pg)?
+	if pg.pageType == pageTypeLeaf {
+		var result []string
+		for _, c := range pg.cells {
+			if prefix == nil || hasPrefix(c.key, prefix) {
+				result = append(result, string(c.key))
+			}
+		}
+		return result, nil
+	}
+	var result []string
+	for _, c := range pg.cells {
+		keys := t.collectKeysSeen(c.childPage, prefix, seen)?
+		result = append(result, keys...)
+	}
+	if pg.rightChild != 0 {
+		keys := t.collectKeysSeen(pg.rightChild, prefix, seen)?
+		result = append(result, keys...)
+	}
+	return result, nil
+}
+
+func (t *btree) countInPage(id uint32) (int, error) {
+	return t.countInPageSeen(id, make(map[uint32]bool))
+}
+
+func (t *btree) countInPageSeen(id uint32, seen map[uint32]bool) (int, error) {
+	visitNode(seen, id)?
+	pg := t.pager.readPage(id)?
+	ensureNodePageType(pg)?
+	if pg.pageType == pageTypeLeaf {
+		return int(pg.cellCount), nil
+	}
+	total := 0
+	for _, c := range pg.cells {
+		n := t.countInPageSeen(c.childPage, seen)?
+		total += n
+	}
+	if pg.rightChild != 0 {
+		n := t.countInPageSeen(pg.rightChild, seen)?
+		total += n
+	}
+	return total, nil
+}
+
+func (t *btree) makeLeafCell(key, value []byte) (cell, error) {
+	c := cell{key: cloneBytes(key)}
+	if len(value) <= maxInlineValue && leafCellFitsInPage(inlineLeafCellSize(len(key), len(value))) {
+		c.value = cloneBytes(value)
+		return c, nil
+	}
+	if !leafCellFitsInPage(overflowLeafCellSize(len(key))) {
+		return cell{}, errors.New("vostore: key too large for leaf page")
+	}
+	c.overflowID = t.writeOverflow(value)?
+	return c, nil
+}
+
+func cloneCells(src []cell) []cell {
+	if src == nil {
+		return nil
+	}
+	dst := make([]cell, len(src))
+	for i, c := range src {
+		dst[i] = cloneCell(c)
+	}
+	return dst
+}
+
+func insertCellAt(cells []cell, idx int, c cell) []cell {
+	cells = append(cells, cell{})
+	copy(cells[idx+1:], cells[idx:])
+	cells[idx] = c
+	return cells
+}
+
+func removeCellAt(cells []cell, idx int) []cell {
+	copy(cells[idx:], cells[idx+1:])
+	return cells[:len(cells)-1]
+}
+
+func (t *btree) firstKeyInPage(id uint32) ([]byte, error) {
+	return t.firstKeyInPageSeen(id, make(map[uint32]bool))
+}
+
+func (t *btree) firstKeyInPageSeen(id uint32, seen map[uint32]bool) ([]byte, error) {
+	visitNode(seen, id)?
+	pg := t.pager.readPage(id)?
+	ensureNodePageType(pg)?
+	if pg.pageType == pageTypeLeaf {
+		if pg.cellCount == 0 {
+			return nil, errors.New("vostore: corrupt btree: empty leaf in firstKeyInPage")
+		}
+		return cloneBytes(pg.cells[0].key), nil
+	}
+	if pg.cellCount == 0 {
+		if pg.rightChild == 0 {
+			return nil, errors.New("vostore: corrupt btree: empty interior in firstKeyInPage")
+		}
+		return t.firstKeyInPageSeen(pg.rightChild, seen)
+	}
+	return t.firstKeyInPageSeen(pg.cells[0].childPage, seen)
+}
+
+func (t *btree) rebuildInteriorPage(pg *page, children []uint32) error {
+	if len(children) == 0 {
+		pg.cells = nil
+		pg.cellCount = 0
+		pg.rightChild = 0
+		return nil
+	}
+	if len(children) == 1 {
+		pg.cells = nil
+		pg.cellCount = 0
+		pg.rightChild = children[0]
+		return nil
+	}
+	cells := make([]cell, len(children)-1)
+	for i := 0; i < len(children)-1; i++ {
+		sepKey := t.firstKeyInPage(children[i+1])?
+		cells[i] = cell{
+			childPage: children[i],
+			key:       sepKey,
+		}
+	}
+	pg.cells = cells
+	pg.cellCount = uint16(len(cells))
+	pg.rightChild = children[len(children)-1]
+	return nil
+}
+
+func interiorChildPages(pg page) []uint32 {
+	children := make([]uint32, 0, len(pg.cells)+1)
+	for _, c := range pg.cells {
+		children = append(children, c.childPage)
+	}
+	if pg.rightChild != 0 || len(children) != 0 {
+		children = append(children, pg.rightChild)
+	}
+	return children
+}
+
+func removeChildPageAt(children []uint32, idx int) []uint32 {
+	copy(children[idx:], children[idx+1:])
+	return children[:len(children)-1]
+}
+
+func (t *btree) rebalanceChildAt(children []uint32, childIdx int) ([]uint32, error) {
+	if childIdx < 0 || childIdx >= len(children) {
+		return children, nil
+	}
+	child := t.pager.readPage(children[childIdx])?
+	ensureNodePageType(child)?
+	if !pageNeedsRebalance(child) {
+		return children, nil
+	}
+	if child.pageType == pageTypeLeaf {
+		if childIdx > 0 {
+			updated, changed, err := t.rebalanceLeafPair(children, childIdx-1)
+			if err != nil {
+				return nil, err
+			}
+			if changed {
+				return updated, nil
+			}
+		}
+		if childIdx+1 < len(children) {
+			updated, changed, err := t.rebalanceLeafPair(children, childIdx)
+			if err != nil {
+				return nil, err
+			}
+			if changed {
+				return updated, nil
+			}
+		}
+		return children, nil
+	}
+	if childIdx > 0 {
+		updated, changed, err := t.rebalanceInteriorPair(children, childIdx-1)
+		if err != nil {
+			return nil, err
+		}
+		if changed {
+			return updated, nil
+		}
+	}
+	if childIdx+1 < len(children) {
+		updated, changed, err := t.rebalanceInteriorPair(children, childIdx)
+		if err != nil {
+			return nil, err
+		}
+		if changed {
+			return updated, nil
+		}
+	}
+	return children, nil
+}
+
+func (t *btree) rebalanceLeafPair(children []uint32, leftIdx int) ([]uint32, bool, error) {
+	left := t.pager.readPage(children[leftIdx])?
+	right := t.pager.readPage(children[leftIdx+1])?
+	ensureNodePageType(left)?
+	ensureNodePageType(right)?
+	if left.pageType != pageTypeLeaf || right.pageType != pageTypeLeaf {
+		return children, false, nil
+	}
+	combined := cloneCells(left.cells)
+	combined = append(combined, cloneCells(right.cells)...)
+	if leafCellsFit(combined) {
+		merged := t.pager.cowPage(left.id)?
+		merged.cells = cloneCells(combined)
+		merged.cellCount = uint16(len(merged.cells))
+		t.pager.writePage(merged)?
+		t.pager.retirePage(right.id)?
+		return replaceChildPair(children, leftIdx, []uint32{merged.id}), true, nil
+	}
+	splitIdx, found := bestLeafSplit(combined)
+	if !found || splitIdx == len(left.cells) {
+		return children, false, nil
+	}
+	newLeft := t.pager.cowPage(left.id)?
+	newRight := t.pager.cowPage(right.id)?
+	newLeft.cells = cloneCells(combined[:splitIdx])
+	newLeft.cellCount = uint16(len(newLeft.cells))
+	newRight.cells = cloneCells(combined[splitIdx:])
+	newRight.cellCount = uint16(len(newRight.cells))
+	t.pager.writePage(newLeft)?
+	t.pager.writePage(newRight)?
+	return replaceChildPair(children, leftIdx, []uint32{newLeft.id, newRight.id}), true, nil
+}
+
+func (t *btree) rebalanceInteriorPair(children []uint32, leftIdx int) ([]uint32, bool, error) {
+	left := t.pager.readPage(children[leftIdx])?
+	right := t.pager.readPage(children[leftIdx+1])?
+	ensureNodePageType(left)?
+	ensureNodePageType(right)?
+	if left.pageType != pageTypeInterior || right.pageType != pageTypeInterior {
+		return children, false, nil
+	}
+	combinedChildren := interiorChildPages(left)
+	combinedChildren = append(combinedChildren, interiorChildPages(right)...)
+	fit, err := t.interiorChildrenFit(combinedChildren)
+	if err != nil {
+		return nil, false, err
+	}
+	if fit {
+		merged := t.pager.cowPage(left.id)?
+		t.rebuildInteriorPage(&merged, combinedChildren)?
+		t.pager.writePage(merged)?
+		t.pager.retirePage(right.id)?
+		return replaceChildPair(children, leftIdx, []uint32{merged.id}), true, nil
+	}
+	splitIdx, found, err := t.bestInteriorSplit(combinedChildren)
+	if err != nil {
+		return nil, false, err
+	}
+	if !found || splitIdx == len(interiorChildPages(left)) {
+		return children, false, nil
+	}
+	newLeft := t.pager.cowPage(left.id)?
+	newRight := t.pager.cowPage(right.id)?
+	t.rebuildInteriorPage(&newLeft, combinedChildren[:splitIdx])?
+	t.rebuildInteriorPage(&newRight, combinedChildren[splitIdx:])?
+	t.pager.writePage(newLeft)?
+	t.pager.writePage(newRight)?
+	return replaceChildPair(children, leftIdx, []uint32{newLeft.id, newRight.id}), true, nil
+}
+
+func (t *btree) bestInteriorSplit(children []uint32) (int, bool, error) {
+	if len(children) < 2 {
+		return 0, false, nil
+	}
+	bestIdx := 0
+	bestScore := 0
+	found := false
+	for i := 1; i < len(children); i++ {
+		leftUsed, err := t.interiorChildrenUsedSpace(children[:i])
+		if err != nil {
+			return 0, false, err
+		}
+		rightUsed, err := t.interiorChildrenUsedSpace(children[i:])
+		if err != nil {
+			return 0, false, err
+		}
+		if leftUsed > pageSize || rightUsed > pageSize {
+			continue
+		}
+		score := absInt(leftUsed - rightUsed)
+		if !found || score < bestScore {
+			bestIdx = i
+			bestScore = score
+			found = true
+		}
+	}
+	return bestIdx, found, nil
+}
+
+func (t *btree) interiorChildrenFit(children []uint32) (bool, error) {
+	used, err := t.interiorChildrenUsedSpace(children)
+	if err != nil {
+		return false, err
+	}
+	return used <= pageSize, nil
+}
+
+func (t *btree) interiorChildrenUsedSpace(children []uint32) (int, error) {
+	pg := page{pageType: pageTypeInterior}
+	t.rebuildInteriorPage(&pg, children)?
+	return pageUsedSpace(pg), nil
+}
+
+func leafCellsFit(cells []cell) bool {
+	pg := page{
+		pageType:  pageTypeLeaf,
+		cellCount: uint16(len(cells)),
+		cells:     cells,
+	}
+	return pageUsedSpace(pg) <= pageSize
+}
+
+func bestLeafSplit(cells []cell) (int, bool) {
+	if len(cells) < 2 {
+		return 0, false
+	}
+	bestIdx := 0
+	bestScore := 0
+	found := false
+	for i := 1; i < len(cells); i++ {
+		left := page{pageType: pageTypeLeaf, cellCount: uint16(i), cells: cells[:i]}
+		right := page{pageType: pageTypeLeaf, cellCount: uint16(len(cells) - i), cells: cells[i:]}
+		leftUsed := pageUsedSpace(left)
+		rightUsed := pageUsedSpace(right)
+		if leftUsed > pageSize || rightUsed > pageSize {
+			continue
+		}
+		score := absInt(leftUsed - rightUsed)
+		if !found || score < bestScore {
+			bestIdx = i
+			bestScore = score
+			found = true
+		}
+	}
+	return bestIdx, found
+}
+
+func pageNeedsRebalance(pg page) bool {
+	if pg.cellCount == 0 {
+		return false
+	}
+	return pageUsedSpace(pg) < pageSize/2
+}
+
+func replaceChildPair(children []uint32, leftIdx int, replacement []uint32) []uint32 {
+	result := make([]uint32, 0, len(children)-2+len(replacement))
+	result = append(result, children[:leftIdx]...)
+	result = append(result, replacement...)
+	result = append(result, children[leftIdx+2:]...)
+	return result
+}
+
+func absInt(v int) int {
+	if v < 0 {
+		return -v
+	}
+	return v
+}
+
+func (t *btree) makeLeafSplittable(cells []cell) ([]cell, error) {
+	working := cloneCells(cells)
+	for {
+		if leafCellsFit(working) {
+			return working, nil
+		}
+		if _, found := bestLeafSplit(working); found {
+			return working, nil
+		}
+		idx := largestInlineLeafCellIndex(working)
+		if idx < 0 {
+			return nil, errors.New(fmt.Sprintf("vostore: cannot split leaf page: no inline cell can be externalized sizes=%v", leafCellSizes(working)))
+		}
+		converted, err := t.externalizeLeafCell(working[idx])
+		if err != nil {
+			return nil, err
+		}
+		working[idx] = converted
+	}
+}
+
+func (t *btree) externalizeLeafCell(c cell) (cell, error) {
+	if c.overflowID != 0 {
+		return cloneCell(c), nil
+	}
+	if !leafCellFitsInPage(overflowLeafCellSize(len(c.key))) {
+		return cell{}, errors.New("vostore: key too large for leaf page")
+	}
+	overflowID := t.writeOverflow(c.value)?
+	return cell{
+		key:        cloneBytes(c.key),
+		overflowID: overflowID,
+	}, nil
+}
+
+func largestInlineLeafCellIndex(cells []cell) int {
+	bestIdx := -1
+	bestSize := 0
+	for i, c := range cells {
+		if c.overflowID != 0 {
+			continue
+		}
+		size := cellSize(c, true)
+		if bestIdx < 0 || size > bestSize {
+			bestIdx = i
+			bestSize = size
+		}
+	}
+	return bestIdx
+}
+
+func leafCellSizes(cells []cell) []int {
+	sizes := make([]int, len(cells))
+	for i, c := range cells {
+		sizes[i] = cellSize(c, true)
+	}
+	return sizes
+}

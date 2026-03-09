@@ -1,0 +1,2083 @@
+package main
+
+import (
+	"encoding/binary"
+	"fmt"
+	"github.com/vo-lang/vostore"
+	"os"
+	"path/filepath"
+)
+
+func main() {
+	tmpDir, err := os.MkdirTemp("", "vo-test-vostore-*")
+	assert(err == nil, "create temp dir")
+	defer os.RemoveAll(tmpDir)
+
+	testBasicCRUD(tmpDir)
+	testGetBytesIsolation(tmpDir)
+	testBatchOps(tmpDir)
+	testBatchRollback(tmpDir)
+	testBatchOverwriteRollback(tmpDir)
+	testBatchDeleteRollback(tmpDir)
+	testOverwrite(tmpDir)
+	testKeys(tmpDir)
+	testPrefixKeys(tmpDir)
+	testLen(tmpDir)
+	testClear(tmpDir)
+	testClearReopen(tmpDir)
+	testTransactionalClear(tmpDir)
+	testClearRollback(tmpDir)
+	testPersistence(tmpDir)
+	testManyKeys(tmpDir)
+	testDeepDeleteReinsert(tmpDir)
+	testDeleteCollapseRootAndReexpand(tmpDir)
+	testDeleteRefreshesMiddleSeparators(tmpDir)
+	testDeleteNonExistent(tmpDir)
+	testEmptyStore(tmpDir)
+	testLargeValue(tmpDir)
+	testOverflowOverwrite(tmpDir)
+	testOverflowDelete(tmpDir)
+	testLargeKeyOverflow(tmpDir)
+	testKeyValidation(tmpDir)
+	testCorruptRootPageType(tmpDir)
+	testBtreeCycleDetected(tmpDir)
+	testLatestHeaderRecovery(tmpDir)
+	testInvalidPageSizeHeader(tmpDir)
+	testLargeKeyInteriorRootSplit(tmpDir)
+	testFreeListReuse(tmpDir)
+	testPendingFreeRecovery(tmpDir)
+	testOverflowCycleDetected(tmpDir)
+	testModelRandomOps(tmpDir)
+	testModelRandomBytesOps(tmpDir)
+	testTransactionCleanupOnPanic(tmpDir)
+}
+
+func testBasicCRUD(tmpDir string) {
+	path := filepath.Join([]string{tmpDir, "crud.vokv"})
+	db, err := vostore.Open(path)
+	assert(err == nil, "open db for crud")
+
+	err = db.Set("name", "Alice")
+	assert(err == nil, "set name")
+
+	val, ok, err := db.Get("name")
+	assert(err == nil, "get name err")
+	assert(ok, "get name found")
+	assert(val == "Alice", "get name value")
+
+	has, err := db.Has("name")
+	assert(err == nil, "has name err")
+	assert(has, "has name")
+	has, err = db.Has("missing")
+	assert(err == nil, "has missing err")
+	assert(!has, "has missing")
+
+	found, err := db.Delete("name")
+	assert(err == nil, "delete name")
+	assert(found, "delete found")
+
+	_, ok, err = db.Get("name")
+	assert(err == nil, "get after delete err")
+	assert(!ok, "get after delete")
+
+	err = db.Close()
+	assert(err == nil, "close crud db")
+}
+
+func testGetBytesIsolation(tmpDir string) {
+	path := filepath.Join([]string{tmpDir, "getbytes_isolation.vokv"})
+	db, err := vostore.Open(path)
+	assert(err == nil, "open db for getbytes isolation")
+
+	err = db.SetBytes("key", []byte{1, 2, 3})
+	assert(err == nil, "set bytes for getbytes isolation")
+
+	got, ok, err := db.GetBytes("key")
+	assert(err == nil, "get bytes for getbytes isolation err")
+	assert(ok, "get bytes for getbytes isolation found")
+	got[0] = 9
+
+	again, ok, err := db.GetBytes("key")
+	assert(err == nil, "get bytes again for getbytes isolation err")
+	assert(ok, "get bytes again for getbytes isolation found")
+	assert(len(again) == 3, "getbytes isolation length")
+	assert(again[0] == 1, "getbytes isolation byte 0")
+	assert(again[1] == 2, "getbytes isolation byte 1")
+	assert(again[2] == 3, "getbytes isolation byte 2")
+
+	err = db.Close()
+	assert(err == nil, "close db for getbytes isolation")
+}
+
+func testBatchOps(tmpDir string) {
+	path := filepath.Join([]string{tmpDir, "batch.vokv"})
+	db, err := vostore.Open(path)
+	assert(err == nil, "open db for batch")
+
+	err = db.Update(func(tx *vostore.Tx) error {
+		tx.Set("a", "1")?
+		tx.Set("b", "2")?
+		tx.Set("c", "3")?
+		return nil
+	})
+	assert(err == nil, "batch set")
+
+	val, ok, err := db.Get("a")
+	assert(err == nil, "batch get a err")
+	assert(ok, "batch get a")
+	assert(val == "1", "batch get a value")
+
+	val, ok, err = db.Get("c")
+	assert(err == nil, "batch get c err")
+	assert(ok, "batch get c")
+	assert(val == "3", "batch get c value")
+
+	n, err := db.Len()
+	assert(err == nil, "batch len err")
+	assert(n == 3, "batch len")
+
+	err = db.Close()
+	assert(err == nil, "close batch db")
+}
+
+func testBatchRollback(tmpDir string) {
+	path := filepath.Join([]string{tmpDir, "batch_rollback.vokv"})
+	db, err := vostore.Open(path)
+	assert(err == nil, "open db for batch rollback")
+
+	// Pre-populate one key
+	err = db.Set("existing", "before")
+	assert(err == nil, "set existing")
+
+	// Batch that inserts some keys, then fails on empty key
+	err = db.Update(func(tx *vostore.Tx) error {
+		tx.Set("new1", "val1")?
+		tx.Set("new2", "val2")?
+		tx.Set("", "should fail")?
+		return nil
+	})
+	assert(err != nil, "batch should fail on empty key")
+
+	// After rollback: "new1" and "new2" should NOT exist
+	_, ok, err := db.Get("new1")
+	assert(err == nil, "get new1 err")
+	assert(!ok, "new1 should not exist after rollback")
+	_, ok, err = db.Get("new2")
+	assert(err == nil, "get new2 err")
+	assert(!ok, "new2 should not exist after rollback")
+
+	// "existing" should still be there
+	val, ok, err := db.Get("existing")
+	assert(err == nil, "get existing err")
+	assert(ok, "existing should survive rollback")
+	assert(val == "before", "existing value after rollback")
+
+	err = db.Close()
+	assert(err == nil, "close batch rollback db")
+}
+
+func testBatchOverwriteRollback(tmpDir string) {
+	path := filepath.Join([]string{tmpDir, "batch_overwrite_rollback.vokv"})
+	db, err := vostore.Open(path)
+	assert(err == nil, "open db for batch overwrite rollback")
+
+	err = db.Set("existing", "before")
+	assert(err == nil, "set existing for overwrite rollback")
+
+	err = db.Update(func(tx *vostore.Tx) error {
+		tx.Set("existing", "after")?
+		tx.Set("", "fail")?
+		return nil
+	})
+	assert(err != nil, "batch overwrite rollback should fail")
+
+	val, ok, err := db.Get("existing")
+	assert(err == nil, "get existing after overwrite rollback err")
+	assert(ok, "existing should exist after overwrite rollback")
+	assert(val == "before", "existing value after overwrite rollback")
+
+	err = db.Close()
+	assert(err == nil, "close batch overwrite rollback db")
+}
+
+func testBatchDeleteRollback(tmpDir string) {
+	path := filepath.Join([]string{tmpDir, "batch_delete_rollback.vokv"})
+	db, err := vostore.Open(path)
+	assert(err == nil, "open db for batch delete rollback")
+
+	err = db.Set("existing", "before")
+	assert(err == nil, "set existing for delete rollback")
+
+	err = db.Update(func(tx *vostore.Tx) error {
+		_, deleteErr := tx.Delete("existing")
+		deleteErr?
+		tx.Set("", "fail")?
+		return nil
+	})
+	assert(err != nil, "batch delete rollback should fail")
+
+	val, ok, err := db.Get("existing")
+	assert(err == nil, "get existing after delete rollback err")
+	assert(ok, "existing should exist after delete rollback")
+	assert(val == "before", "existing value after delete rollback")
+
+	err = db.Close()
+	assert(err == nil, "close batch delete rollback db")
+}
+
+func testOverwrite(tmpDir string) {
+	path := filepath.Join([]string{tmpDir, "overwrite.vokv"})
+	db, err := vostore.Open(path)
+	assert(err == nil, "open db for overwrite")
+
+	err = db.Set("key", "v1")
+	assert(err == nil, "set v1")
+
+	err = db.Set("key", "v2")
+	assert(err == nil, "set v2")
+
+	val, ok, err := db.Get("key")
+	assert(err == nil, "get overwritten err")
+	assert(ok, "get overwritten key")
+	assert(val == "v2", "overwritten value")
+
+	err = db.Close()
+	assert(err == nil, "close overwrite db")
+}
+
+func testKeys(tmpDir string) {
+	path := filepath.Join([]string{tmpDir, "keys.vokv"})
+	db, err := vostore.Open(path)
+	assert(err == nil, "open db for keys")
+
+	err = db.Update(func(tx *vostore.Tx) error {
+		tx.Set("apple", "1")?
+		tx.Set("banana", "2")?
+		tx.Set("cherry", "3")?
+		return nil
+	})
+	assert(err == nil, "batch set for keys")
+
+	keys, err := db.Keys("")
+	assert(err == nil, "keys err")
+	assert(len(keys) == 3, "all keys count")
+	assert(keys[0] == "apple", "keys sorted 0")
+	assert(keys[1] == "banana", "keys sorted 1")
+	assert(keys[2] == "cherry", "keys sorted 2")
+
+	err = db.Close()
+	assert(err == nil, "close keys db")
+}
+
+func testPrefixKeys(tmpDir string) {
+	path := filepath.Join([]string{tmpDir, "prefix.vokv"})
+	db, err := vostore.Open(path)
+	assert(err == nil, "open db for prefix")
+
+	err = db.Update(func(tx *vostore.Tx) error {
+		tx.Set("user:1:name", "Alice")?
+		tx.Set("user:1:email", "alice@example.com")?
+		tx.Set("user:2:name", "Bob")?
+		tx.Set("config:theme", "dark")?
+		return nil
+	})
+	assert(err == nil, "batch set for prefix")
+
+	userKeys, err := db.Keys("user:1:")
+	assert(err == nil, "prefix user:1: err")
+	assert(len(userKeys) == 2, "prefix user:1: count")
+
+	configKeys, err := db.Keys("config:")
+	assert(err == nil, "prefix config: err")
+	assert(len(configKeys) == 1, "prefix config: count")
+	assert(configKeys[0] == "config:theme", "prefix config key")
+
+	err = db.Close()
+	assert(err == nil, "close prefix db")
+}
+
+func testLen(tmpDir string) {
+	path := filepath.Join([]string{tmpDir, "len.vokv"})
+	db, err := vostore.Open(path)
+	assert(err == nil, "open db for len")
+
+	n, err := db.Len()
+	assert(err == nil, "empty len err")
+	assert(n == 0, "empty len")
+
+	db.Set("a", "1")
+	n, err = db.Len()
+	assert(err == nil, "len after 1 err")
+	assert(n == 1, "len after 1 insert")
+
+	db.Set("b", "2")
+	n, err = db.Len()
+	assert(err == nil, "len after 2 err")
+	assert(n == 2, "len after 2 inserts")
+
+	db.Delete("a")
+	n, err = db.Len()
+	assert(err == nil, "len after delete err")
+	assert(n == 1, "len after delete")
+
+	err = db.Close()
+	assert(err == nil, "close len db")
+}
+
+func testClear(tmpDir string) {
+	path := filepath.Join([]string{tmpDir, "clear.vokv"})
+	db, err := vostore.Open(path)
+	assert(err == nil, "open db for clear")
+
+	db.Set("x", "1")
+	db.Set("y", "2")
+	n, err := db.Len()
+	assert(err == nil, "len before clear err")
+	assert(n == 2, "len before clear")
+
+	err = db.Clear()
+	assert(err == nil, "clear")
+	n, err = db.Len()
+	assert(err == nil, "len after clear err")
+	assert(n == 0, "len after clear")
+	has, err := db.Has("x")
+	assert(err == nil, "has after clear err")
+	assert(!has, "has after clear")
+
+	// Can still use after clear
+	db.Set("z", "3")
+	n, err = db.Len()
+	assert(err == nil, "len after re-insert err")
+	assert(n == 1, "len after re-insert")
+
+	err = db.Close()
+	assert(err == nil, "close clear db")
+}
+
+func testClearReopen(tmpDir string) {
+	path := filepath.Join([]string{tmpDir, "clear_reopen.vokv"})
+	db, err := vostore.Open(path)
+	assert(err == nil, "open db for clear reopen")
+	err = db.Set("x", "1")
+	assert(err == nil, "set before clear reopen")
+	err = db.Clear()
+	assert(err == nil, "clear before reopen")
+	err = db.Close()
+	assert(err == nil, "close db after clear before reopen")
+
+	db, err = vostore.Open(path)
+	assert(err == nil, "reopen db after clear")
+	n, err := db.Len()
+	assert(err == nil, "len after clear reopen err")
+	assert(n == 0, "len after clear reopen")
+	err = db.Set("y", "2")
+	assert(err == nil, "set after clear reopen")
+	val, ok, err := db.Get("y")
+	assert(err == nil, "get after clear reopen err")
+	assert(ok, "get after clear reopen found")
+	assert(val == "2", "get after clear reopen value")
+	err = db.Close()
+	assert(err == nil, "close db after clear reopen")
+}
+
+func testTransactionalClear(tmpDir string) {
+	path := filepath.Join([]string{tmpDir, "tx_clear.vokv"})
+	db, err := vostore.Open(path)
+	assert(err == nil, "open db for transactional clear")
+
+	err = db.Set("before", "1")
+	assert(err == nil, "seed value for transactional clear")
+
+	err = db.Update(func(tx *vostore.Tx) error {
+		tx.Clear()?
+		_, ok, err := tx.Get("before")
+		assert(err == nil, "get cleared key inside transactional clear")
+		assert(!ok, "cleared key should disappear inside transaction")
+		tx.Set("after", "2")?
+		n, err := tx.Len()
+		assert(err == nil, "len after transactional clear")
+		assert(n == 1, "len after transactional clear")
+		return nil
+	})
+	assert(err == nil, "transactional clear should commit")
+
+	_, ok, err := db.Get("before")
+	assert(err == nil, "get old key after transactional clear err")
+	assert(!ok, "old key should be removed after transactional clear")
+	val, ok, err := db.Get("after")
+	assert(err == nil, "get new key after transactional clear err")
+	assert(ok, "new key should exist after transactional clear")
+	assert(val == "2", "new key value after transactional clear")
+
+	err = db.Close()
+	assert(err == nil, "close db for transactional clear")
+}
+
+func testClearRollback(tmpDir string) {
+	path := filepath.Join([]string{tmpDir, "clear_rollback.vokv"})
+	db, err := vostore.Open(path)
+	assert(err == nil, "open db for clear rollback")
+
+	err = db.Set("existing", "before")
+	assert(err == nil, "seed existing key for clear rollback")
+
+	err = db.Update(func(tx *vostore.Tx) error {
+		tx.Clear()?
+		tx.Set("", "fail")?
+		return nil
+	})
+	assert(err != nil, "clear rollback should fail")
+
+	val, ok, err := db.Get("existing")
+	assert(err == nil, "get existing after clear rollback err")
+	assert(ok, "existing should survive clear rollback")
+	assert(val == "before", "existing value after clear rollback")
+
+	err = db.Close()
+	assert(err == nil, "close db for clear rollback")
+}
+
+func testPersistence(tmpDir string) {
+	path := filepath.Join([]string{tmpDir, "persist.vokv"})
+
+	// Write and close
+	db, err := vostore.Open(path)
+	assert(err == nil, "open db for persist write")
+	db.Set("persist", "yes")
+	db.Set("count", "42")
+	err = db.Close()
+	assert(err == nil, "close persist write")
+
+	// Reopen and read
+	db, err = vostore.Open(path)
+	assert(err == nil, "reopen db for persist read")
+
+	val, ok, err := db.Get("persist")
+	assert(err == nil, "persist get err")
+	assert(ok, "persist found after reopen")
+	assert(val == "yes", "persist value after reopen")
+
+	val, ok, err = db.Get("count")
+	assert(err == nil, "count get err")
+	assert(ok, "count found after reopen")
+	assert(val == "42", "count value after reopen")
+
+	err = db.Close()
+	assert(err == nil, "close persist read")
+}
+
+func testManyKeys(tmpDir string) {
+	path := filepath.Join([]string{tmpDir, "many.vokv"})
+	db, err := vostore.Open(path)
+	assert(err == nil, "open db for many keys")
+
+	// Insert 200 keys to trigger multiple splits
+	count := 200
+	err = db.Update(func(tx *vostore.Tx) error {
+		for i := 0; i < count; i++ {
+			key := padNum(i, 4)
+			tx.Set(key, key)?
+		}
+		return nil
+	})
+	assert(err == nil, "batch insert many")
+	n, err := db.Len()
+	assert(err == nil, "many keys len err")
+	assert(n == count, "many keys len")
+
+	// Verify all keys exist
+	for i := 0; i < count; i++ {
+		key := padNum(i, 4)
+		val, ok, err := db.Get(key)
+		assert(err == nil, "many get err "+key)
+		assert(ok, "many get "+key)
+		assert(val == key, "many value "+key)
+	}
+
+	// Delete half
+	for i := 0; i < count; i += 2 {
+		key := padNum(i, 4)
+		found, err := db.Delete(key)
+		assert(err == nil, "many delete "+key)
+		assert(found, "many delete found "+key)
+	}
+	n, err = db.Len()
+	assert(err == nil, "many len after delete err")
+	assert(n == count/2, "many len after delete half")
+
+	// Verify remaining
+	for i := 1; i < count; i += 2 {
+		key := padNum(i, 4)
+		val, ok, err := db.Get(key)
+		assert(err == nil, "many get remaining err "+key)
+		assert(ok, "many get remaining "+key)
+		assert(val == key, "many value remaining "+key)
+	}
+
+	err = db.Close()
+	assert(err == nil, "close many db")
+}
+
+func testDeepDeleteReinsert(tmpDir string) {
+	path := filepath.Join([]string{tmpDir, "deep_delete_reinsert.vokv"})
+	db, err := vostore.Open(path)
+	assert(err == nil, "open db for deep delete reinsert")
+
+	count := 1200
+	err = db.Update(func(tx *vostore.Tx) error {
+		for i := 0; i < count; i++ {
+			key := "item:" + padNum(i, 4)
+			tx.Set(key, key)?
+		}
+		return nil
+	})
+	assert(err == nil, "populate db for deep delete reinsert")
+
+	for i := 200; i < 1000; i++ {
+		key := "item:" + padNum(i, 4)
+		found, deleteErr := db.Delete(key)
+		assert(deleteErr == nil, "delete key for deep delete reinsert")
+		assert(found, "delete found for deep delete reinsert")
+	}
+
+	n, err := db.Len()
+	assert(err == nil, "len after deep delete reinsert deletes")
+	assert(n == 400, "len after deep delete reinsert deletes")
+	assertStructuralInvariants(path)
+
+	err = db.Close()
+	assert(err == nil, "close db after deletes for deep delete reinsert")
+
+	db, err = vostore.Open(path)
+	assert(err == nil, "reopen db after deletes for deep delete reinsert")
+
+	for i := 0; i < 200; i++ {
+		key := "item:" + padNum(i, 4)
+		val, ok, getErr := db.Get(key)
+		assert(getErr == nil, "get low retained key after deep delete reinsert")
+		assert(ok, "low retained key should exist after deep delete reinsert")
+		assert(val == key, "low retained key value after deep delete reinsert")
+	}
+	for i := 200; i < 1000; i++ {
+		key := "item:" + padNum(i, 4)
+		_, ok, getErr := db.Get(key)
+		assert(getErr == nil, "get deleted key after deep delete reinsert")
+		assert(!ok, "deleted key should be absent after deep delete reinsert")
+	}
+	for i := 1000; i < count; i++ {
+		key := "item:" + padNum(i, 4)
+		val, ok, getErr := db.Get(key)
+		assert(getErr == nil, "get high retained key after deep delete reinsert")
+		assert(ok, "high retained key should exist after deep delete reinsert")
+		assert(val == key, "high retained key value after deep delete reinsert")
+	}
+
+	err = db.Update(func(tx *vostore.Tx) error {
+		for i := 200; i < 1000; i++ {
+			key := "item:" + padNum(i, 4)
+			value := "new:" + padNum(i, 4)
+			tx.Set(key, value)?
+		}
+		return nil
+	})
+	assert(err == nil, "reinsert deleted range for deep delete reinsert")
+
+	n, err = db.Len()
+	assert(err == nil, "len after deep delete reinsert reinserts")
+	assert(n == count, "len after deep delete reinsert reinserts")
+	assertStructuralInvariants(path)
+
+	keys, err := db.Keys("item:")
+	assert(err == nil, "keys after deep delete reinsert")
+	assert(len(keys) == count, "keys count after deep delete reinsert")
+	for i := 0; i < count; i++ {
+		expectedKey := "item:" + padNum(i, 4)
+		assert(keys[i] == expectedKey, "key order after deep delete reinsert")
+		val, ok, getErr := db.Get(expectedKey)
+		assert(getErr == nil, "get after deep delete reinsert final")
+		assert(ok, "final key should exist after deep delete reinsert")
+		if i >= 200 && i < 1000 {
+			assert(val == "new:"+padNum(i, 4), "final reinserted value after deep delete reinsert")
+		} else {
+			assert(val == expectedKey, "final retained value after deep delete reinsert")
+		}
+	}
+
+	err = db.Close()
+	assert(err == nil, "close db for deep delete reinsert")
+}
+
+func testDeleteCollapseRootAndReexpand(tmpDir string) {
+	path := filepath.Join([]string{tmpDir, "delete_collapse_root_reexpand.vokv"})
+	db, err := vostore.Open(path)
+	assert(err == nil, "open db for delete collapse root reexpand")
+
+	count := 1200
+	err = db.Update(func(tx *vostore.Tx) error {
+		for i := 0; i < count; i++ {
+			key := "item:" + padNum(i, 4)
+			tx.Set(key, key)?
+		}
+		return nil
+	})
+	assert(err == nil, "populate db for delete collapse root reexpand")
+	assertStructuralInvariants(path)
+
+	for i := 0; i < count-1; i++ {
+		key := "item:" + padNum(i, 4)
+		found, deleteErr := db.Delete(key)
+		assert(deleteErr == nil, "delete key for delete collapse root reexpand")
+		assert(found, "delete found for delete collapse root reexpand")
+	}
+
+	n, err := db.Len()
+	assert(err == nil, "len after delete collapse root reexpand deletes")
+	assert(n == 1, "len after delete collapse root reexpand deletes")
+	val, ok, err := db.Get("item:" + padNum(count-1, 4))
+	assert(err == nil, "get survivor after delete collapse root reexpand")
+	assert(ok, "survivor exists after delete collapse root reexpand")
+	assert(val == "item:"+padNum(count-1, 4), "survivor value after delete collapse root reexpand")
+	assertStructuralInvariants(path)
+
+	rootPage := readPrimaryRootPage(path)
+	assert(rootPage != 0, "root page exists after delete collapse root reexpand")
+	root := readPageBytes(path, rootPage)
+	assert(root[0] == 1, "root collapses to leaf after delete collapse root reexpand")
+	assert(binary.LittleEndian.Uint16(root[2:4]) == 1, "collapsed root leaf cell count after delete collapse root reexpand")
+	assert(binary.LittleEndian.Uint32(root[4:8]) == 0, "collapsed root next leaf pointer after delete collapse root reexpand")
+
+	err = db.Update(func(tx *vostore.Tx) error {
+		for i := 0; i < count-1; i++ {
+			key := "item:" + padNum(i, 4)
+			value := "new:" + padNum(i, 4)
+			tx.Set(key, value)?
+		}
+		return nil
+	})
+	assert(err == nil, "reinsert keys for delete collapse root reexpand")
+
+	n, err = db.Len()
+	assert(err == nil, "len after delete collapse root reexpand reinserts")
+	assert(n == count, "len after delete collapse root reexpand reinserts")
+	assertStructuralInvariants(path)
+
+	keys, err := db.Keys("item:")
+	assert(err == nil, "keys after delete collapse root reexpand")
+	assert(len(keys) == count, "keys count after delete collapse root reexpand")
+	for i := 0; i < count; i++ {
+		expectedKey := "item:" + padNum(i, 4)
+		assert(keys[i] == expectedKey, "key order after delete collapse root reexpand")
+		got, exists, getErr := db.Get(expectedKey)
+		assert(getErr == nil, "get after delete collapse root reexpand")
+		assert(exists, "key exists after delete collapse root reexpand")
+		if i == count-1 {
+			assert(got == expectedKey, "survivor value after delete collapse root reexpand reinserts")
+		} else {
+			assert(got == "new:"+padNum(i, 4), "reinserted value after delete collapse root reexpand")
+		}
+	}
+
+	err = db.Close()
+	assert(err == nil, "close db for delete collapse root reexpand")
+}
+
+func testDeleteRefreshesMiddleSeparators(tmpDir string) {
+	path := filepath.Join([]string{tmpDir, "delete_refreshes_middle_separators.vokv"})
+	db, err := vostore.Open(path)
+	assert(err == nil, "open db for delete refreshes middle separators")
+
+	count := 1200
+	err = db.Update(func(tx *vostore.Tx) error {
+		for i := 0; i < count; i++ {
+			key := "item:" + padNum(i, 4)
+			tx.Set(key, key)?
+		}
+		return nil
+	})
+	assert(err == nil, "populate db for delete refreshes middle separators")
+
+	for i := 350; i < 850; i++ {
+		key := "item:" + padNum(i, 4)
+		found, deleteErr := db.Delete(key)
+		assert(deleteErr == nil, "delete key for delete refreshes middle separators")
+		assert(found, "delete found for delete refreshes middle separators")
+	}
+
+	n, err := db.Len()
+	assert(err == nil, "len after delete refreshes middle separators")
+	assert(n == 700, "len after delete refreshes middle separators")
+	assertStructuralInvariants(path)
+
+	rootPage := readPrimaryRootPage(path)
+	assert(rootPage != 0, "root page exists after delete refreshes middle separators")
+	root := readPageBytes(path, rootPage)
+	assert(root[0] == 2, "root remains interior after delete refreshes middle separators")
+
+	err = db.Close()
+	assert(err == nil, "close db for delete refreshes middle separators")
+
+	db, err = vostore.Open(path)
+	assert(err == nil, "reopen db for delete refreshes middle separators")
+	assertStructuralInvariants(path)
+
+	for i := 0; i < 350; i++ {
+		key := "item:" + padNum(i, 4)
+		val, ok, getErr := db.Get(key)
+		assert(getErr == nil, "get low retained key after delete refreshes middle separators")
+		assert(ok, "low retained key should exist after delete refreshes middle separators")
+		assert(val == key, "low retained key value after delete refreshes middle separators")
+	}
+	for i := 350; i < 850; i++ {
+		key := "item:" + padNum(i, 4)
+		_, ok, getErr := db.Get(key)
+		assert(getErr == nil, "get deleted middle key after delete refreshes middle separators")
+		assert(!ok, "deleted middle key should be absent after delete refreshes middle separators")
+	}
+	for i := 850; i < count; i++ {
+		key := "item:" + padNum(i, 4)
+		val, ok, getErr := db.Get(key)
+		assert(getErr == nil, "get high retained key after delete refreshes middle separators")
+		assert(ok, "high retained key should exist after delete refreshes middle separators")
+		assert(val == key, "high retained key value after delete refreshes middle separators")
+	}
+
+	keys, err := db.Keys("item:")
+	assert(err == nil, "keys after delete refreshes middle separators")
+	assert(len(keys) == 700, "keys count after delete refreshes middle separators")
+	for i := 0; i < 350; i++ {
+		assert(keys[i] == "item:"+padNum(i, 4), "low key order after delete refreshes middle separators")
+	}
+	for i := 850; i < count; i++ {
+		assert(keys[i-500] == "item:"+padNum(i, 4), "high key order after delete refreshes middle separators")
+	}
+
+	err = db.Close()
+	assert(err == nil, "close reopened db for delete refreshes middle separators")
+}
+
+func testDeleteNonExistent(tmpDir string) {
+	path := filepath.Join([]string{tmpDir, "delete_missing.vokv"})
+	db, err := vostore.Open(path)
+	assert(err == nil, "open db for delete missing")
+
+	found, err := db.Delete("nope")
+	assert(err == nil, "delete non-existent no error")
+	assert(!found, "delete non-existent not found")
+
+	err = db.Close()
+	assert(err == nil, "close dne db")
+}
+
+func testEmptyStore(tmpDir string) {
+	path := filepath.Join([]string{tmpDir, "empty.vokv"})
+	db, err := vostore.Open(path)
+	assert(err == nil, "open empty db")
+
+	_, ok, err := db.Get("any")
+	assert(err == nil, "get from empty err")
+	assert(!ok, "get from empty")
+	n, err := db.Len()
+	assert(err == nil, "empty len err")
+	assert(n == 0, "empty len")
+	keys, err := db.Keys("")
+	assert(err == nil, "empty keys err")
+	assert(len(keys) == 0, "empty keys")
+
+	err = db.Close()
+	assert(err == nil, "close empty db")
+}
+
+func testLargeValue(tmpDir string) {
+	path := filepath.Join([]string{tmpDir, "large.vokv"})
+	db, err := vostore.Open(path)
+	assert(err == nil, "open db for large value")
+
+	// Create a value larger than maxInlineValue (3800 bytes)
+	largeVal := make([]byte, 5000)
+	for i := 0; i < len(largeVal); i++ {
+		largeVal[i] = byte(i % 256)
+	}
+
+	err = db.SetBytes("big", largeVal)
+	assert(err == nil, "set large value")
+
+	got, ok, err := db.GetBytes("big")
+	assert(err == nil, "get large value err")
+	assert(ok, "get large value found")
+	assert(len(got) == len(largeVal), "large value length")
+	for i := 0; i < len(got); i++ {
+		assert(got[i] == largeVal[i], "large value byte mismatch")
+	}
+
+	err = db.Close()
+	assert(err == nil, "close large db")
+
+	db, err = vostore.Open(path)
+	assert(err == nil, "reopen db for large value")
+
+	got, ok, err = db.GetBytes("big")
+	assert(err == nil, "get large value after reopen err")
+	assert(ok, "get large value after reopen found")
+	assert(len(got) == len(largeVal), "large value after reopen length")
+	for i := 0; i < len(got); i++ {
+		assert(got[i] == largeVal[i], "large value after reopen byte mismatch")
+	}
+
+	err = db.Close()
+	assert(err == nil, "close large db after reopen")
+}
+
+func testOverflowOverwrite(tmpDir string) {
+	path := filepath.Join([]string{tmpDir, "overflow_overwrite.vokv"})
+	db, err := vostore.Open(path)
+	assert(err == nil, "open db for overflow overwrite")
+
+	first := make([]byte, 5000)
+	for i := 0; i < len(first); i++ {
+		first[i] = byte(i % 251)
+	}
+	second := make([]byte, 6000)
+	for i := 0; i < len(second); i++ {
+		second[i] = byte((i + 7) % 253)
+	}
+
+	err = db.SetBytes("big", first)
+	assert(err == nil, "set first overflow value")
+	err = db.SetBytes("big", second)
+	assert(err == nil, "overwrite overflow value")
+	err = db.SetBytes("other", first)
+	assert(err == nil, "set second key after overflow overwrite")
+
+	got, ok, err := db.GetBytes("big")
+	assert(err == nil, "get overwritten overflow value err")
+	assert(ok, "get overwritten overflow value found")
+	assert(len(got) == len(second), "overwritten overflow value length")
+	for i := 0; i < len(got); i++ {
+		assert(got[i] == second[i], "overwritten overflow value byte mismatch")
+	}
+
+	err = db.Close()
+	assert(err == nil, "close db for overflow overwrite")
+
+	db, err = vostore.Open(path)
+	assert(err == nil, "reopen db for overflow overwrite")
+
+	got, ok, err = db.GetBytes("big")
+	assert(err == nil, "get overwritten overflow value after reopen err")
+	assert(ok, "get overwritten overflow value after reopen found")
+	assert(len(got) == len(second), "overwritten overflow value after reopen length")
+	for i := 0; i < len(got); i++ {
+		assert(got[i] == second[i], "overwritten overflow value after reopen byte mismatch")
+	}
+
+	got, ok, err = db.GetBytes("other")
+	assert(err == nil, "get second key after overflow overwrite err")
+	assert(ok, "get second key after overflow overwrite found")
+	assert(len(got) == len(first), "second key after overflow overwrite length")
+	for i := 0; i < len(got); i++ {
+		assert(got[i] == first[i], "second key after overflow overwrite byte mismatch")
+	}
+
+	err = db.Close()
+	assert(err == nil, "close db for overflow overwrite after reopen")
+}
+
+func testOverflowDelete(tmpDir string) {
+	path := filepath.Join([]string{tmpDir, "overflow_delete.vokv"})
+	db, err := vostore.Open(path)
+	assert(err == nil, "open db for overflow delete")
+
+	first := make([]byte, 5000)
+	for i := 0; i < len(first); i++ {
+		first[i] = byte(i % 247)
+	}
+	second := make([]byte, 5500)
+	for i := 0; i < len(second); i++ {
+		second[i] = byte((i + 11) % 241)
+	}
+
+	err = db.SetBytes("big", first)
+	assert(err == nil, "set overflow value for delete")
+	found, err := db.Delete("big")
+	assert(err == nil, "delete overflow value err")
+	assert(found, "delete overflow value found")
+	err = db.SetBytes("after", second)
+	assert(err == nil, "set overflow value after delete")
+
+	_, ok, err := db.GetBytes("big")
+	assert(err == nil, "get deleted overflow value err")
+	assert(!ok, "deleted overflow value should not exist")
+
+	err = db.Close()
+	assert(err == nil, "close db for overflow delete")
+
+	db, err = vostore.Open(path)
+	assert(err == nil, "reopen db for overflow delete")
+
+	_, ok, err = db.GetBytes("big")
+	assert(err == nil, "get deleted overflow value after reopen err")
+	assert(!ok, "deleted overflow value should not exist after reopen")
+
+	got, ok, err := db.GetBytes("after")
+	assert(err == nil, "get overflow value after delete after reopen err")
+	assert(ok, "get overflow value after delete after reopen found")
+	assert(len(got) == len(second), "overflow value after delete after reopen length")
+	for i := 0; i < len(got); i++ {
+		assert(got[i] == second[i], "overflow value after delete after reopen byte mismatch")
+	}
+
+	err = db.Close()
+	assert(err == nil, "close db for overflow delete after reopen")
+}
+
+func testLargeKeyOverflow(tmpDir string) {
+	path := filepath.Join([]string{tmpDir, "large_key_overflow.vokv"})
+	db, err := vostore.Open(path)
+	assert(err == nil, "open db for large key overflow")
+
+	bigKey := make([]byte, 4000)
+	for i := 0; i < len(bigKey); i++ {
+		bigKey[i] = byte('k')
+	}
+	value := make([]byte, 100)
+	for i := 0; i < len(value); i++ {
+		value[i] = byte(i)
+	}
+
+	err = db.SetBytes(string(bigKey), value)
+	assert(err == nil, "set large key overflow value")
+
+	got, ok, err := db.GetBytes(string(bigKey))
+	assert(err == nil, "get large key overflow value err")
+	assert(ok, "get large key overflow value found")
+	assert(len(got) == len(value), "large key overflow value length")
+	for i := 0; i < len(got); i++ {
+		assert(got[i] == value[i], "large key overflow value byte mismatch")
+	}
+
+	err = db.Close()
+	assert(err == nil, "close large key overflow db")
+
+	db, err = vostore.Open(path)
+	assert(err == nil, "reopen db for large key overflow")
+
+	got, ok, err = db.GetBytes(string(bigKey))
+	assert(err == nil, "get large key overflow after reopen err")
+	assert(ok, "get large key overflow after reopen found")
+	assert(len(got) == len(value), "large key overflow after reopen length")
+	for i := 0; i < len(got); i++ {
+		assert(got[i] == value[i], "large key overflow after reopen byte mismatch")
+	}
+
+	err = db.Close()
+	assert(err == nil, "close large key overflow db after reopen")
+}
+
+func testKeyValidation(tmpDir string) {
+	path := filepath.Join([]string{tmpDir, "keyval.vokv"})
+	db, err := vostore.Open(path)
+	assert(err == nil, "open db for key validation")
+
+	// Empty key should fail
+	err = db.Set("", "value")
+	assert(err != nil, "empty key should fail")
+
+	// Key too large should fail (maxKeySize = 4000)
+	bigKey := make([]byte, 4001)
+	for i := 0; i < len(bigKey); i++ {
+		bigKey[i] = byte('a')
+	}
+	err = db.Set(string(bigKey), "value")
+	assert(err != nil, "oversized key should fail")
+
+	// Normal key should still work
+	err = db.Set("normal", "value")
+	assert(err == nil, "normal key should work")
+
+	err = db.Close()
+	assert(err == nil, "close key validation db")
+}
+
+func testCorruptRootPageType(tmpDir string) {
+	path := filepath.Join([]string{tmpDir, "corrupt_root_page_type.vokv"})
+	db, err := vostore.Open(path)
+	assert(err == nil, "open db for corrupt root page type")
+	err = db.Set("root", "value")
+	assert(err == nil, "set value for corrupt root page type")
+	err = db.Close()
+	assert(err == nil, "close db for corrupt root page type")
+
+	rootPage := readPrimaryRootPage(path)
+	page := readPageBytes(path, rootPage)
+	page[0] = 3
+	err = writePageBytes(path, rootPage, page)
+	assert(err == nil, "rewrite root page type")
+
+	db, err = vostore.Open(path)
+	assert(err == nil, "reopen db for corrupt root page type")
+	_, _, err = db.Get("root")
+	assert(err != nil, "corrupt root page type should fail on read")
+	err = db.Close()
+	assert(err == nil, "close db for corrupt root page type")
+}
+
+func testBtreeCycleDetected(tmpDir string) {
+	path := filepath.Join([]string{tmpDir, "btree_cycle_detected.vokv"})
+	db, err := vostore.Open(path)
+	assert(err == nil, "open db for btree cycle detected")
+
+	err = db.Update(func(tx *vostore.Tx) error {
+		for i := 0; i < 400; i++ {
+			key := padNum(i, 4)
+			tx.Set(key, key)?
+		}
+		return nil
+	})
+	assert(err == nil, "populate db for btree cycle detected")
+	err = db.Close()
+	assert(err == nil, "close db for btree cycle detected")
+
+	rootPage := readPrimaryRootPage(path)
+	page := readPageBytes(path, rootPage)
+	assert(page[0] == 2, "root should be an interior page for btree cycle detected")
+	binary.LittleEndian.PutUint32(page[4:8], rootPage)
+	err = writePageBytes(path, rootPage, page)
+	assert(err == nil, "rewrite root right child into a cycle")
+
+	db, err = vostore.Open(path)
+	assert(err == nil, "reopen db for btree cycle detected")
+	_, _, err = db.Get("zzzz")
+	assert(err != nil, "btree cycle should fail on search")
+	_, err = db.Len()
+	assert(err != nil, "btree cycle should fail on count")
+	err = db.Close()
+	assert(err == nil, "close db for btree cycle detected")
+}
+
+func testLatestHeaderRecovery(tmpDir string) {
+	path := filepath.Join([]string{tmpDir, "latest_header_recovery.vokv"})
+	db, err := vostore.Open(path)
+	assert(err == nil, "open db for latest header recovery")
+	err = db.Set("persist", "yes")
+	assert(err == nil, "set value for latest header recovery")
+	err = db.Close()
+	assert(err == nil, "close db for latest header recovery")
+
+	buf := readHeaderBytes(path)
+	shadowTxID := binary.LittleEndian.Uint32(buf[testHeaderSize+testOffTxID:])
+	assert(shadowTxID > 0, "shadow txID should be non-zero")
+	binary.LittleEndian.PutUint32(buf[testOffRootPage:], 0)
+	binary.LittleEndian.PutUint32(buf[testOffTxID:], shadowTxID-1)
+	rewriteHeaderChecksum(buf[:testHeaderSize])
+	err = writeHeaderBytes(path, buf)
+	assert(err == nil, "rewrite primary header for latest header recovery")
+
+	db, err = vostore.Open(path)
+	assert(err == nil, "reopen db for latest header recovery")
+	val, ok, err := db.Get("persist")
+	assert(err == nil, "get persisted value after latest header recovery")
+	assert(ok, "persisted value should exist after latest header recovery")
+	assert(val == "yes", "persisted value after latest header recovery")
+	err = db.Close()
+	assert(err == nil, "close recovered db for latest header recovery")
+
+	buf = readHeaderBytes(path)
+	primaryTxID := binary.LittleEndian.Uint32(buf[testOffTxID:])
+	shadowTxID = binary.LittleEndian.Uint32(buf[testHeaderSize+testOffTxID:])
+	assert(primaryTxID == shadowTxID, "header copies should be repaired to same txID")
+	assert(binary.LittleEndian.Uint32(buf[testOffRootPage:]) != 0, "primary header rootPage should be repaired")
+}
+
+func testInvalidPageSizeHeader(tmpDir string) {
+	path := filepath.Join([]string{tmpDir, "invalid_page_size_header.vokv"})
+	db, err := vostore.Open(path)
+	assert(err == nil, "open db for invalid page size header")
+	err = db.Set("persist", "yes")
+	assert(err == nil, "set value for invalid page size header")
+	err = db.Close()
+	assert(err == nil, "close db for invalid page size header")
+
+	buf := readHeaderBytes(path)
+	binary.LittleEndian.PutUint32(buf[testOffPageSize:], 8192)
+	rewriteHeaderChecksum(buf[:testHeaderSize])
+	binary.LittleEndian.PutUint32(buf[testHeaderSize+testOffPageSize:], 8192)
+	rewriteHeaderChecksum(buf[testHeaderSize:testHeaderTotal])
+	err = writeHeaderBytes(path, buf)
+	assert(err == nil, "rewrite invalid page size header")
+
+	_, err = vostore.Open(path)
+	assert(err != nil, "open should fail on unsupported page size")
+}
+
+func testLargeKeyInteriorRootSplit(tmpDir string) {
+	path := filepath.Join([]string{tmpDir, "large_key_interior_root_split.vokv"})
+	db, err := vostore.Open(path)
+	assert(err == nil, "open db for large key interior root split")
+
+	keys := []string{
+		testHugeKey('a'),
+		testHugeKey('b'),
+		testHugeKey('c'),
+	}
+	for i := 0; i < len(keys); i++ {
+		value := []byte{byte(17 + i)}
+		err = db.SetBytes(keys[i], value)
+		assert(err == nil, "set large key for interior root split")
+	}
+
+	for i := 0; i < len(keys); i++ {
+		got, ok, getErr := db.GetBytes(keys[i])
+		assert(getErr == nil, "get large key for interior root split")
+		assert(ok, "large key should exist after interior root split")
+		assert(len(got) == 1, "large key value length after interior root split")
+		assert(got[0] == byte(17+i), "large key value byte after interior root split")
+	}
+
+	err = db.Close()
+	assert(err == nil, "close db for large key interior root split")
+	assertStructuralInvariants(path)
+
+	db, err = vostore.Open(path)
+	assert(err == nil, "reopen db for large key interior root split")
+	for i := 0; i < len(keys); i++ {
+		got, ok, getErr := db.GetBytes(keys[i])
+		assert(getErr == nil, "get large key after reopen for interior root split")
+		assert(ok, "large key should exist after reopen for interior root split")
+		assert(len(got) == 1, "large key value length after reopen for interior root split")
+		assert(got[0] == byte(17+i), "large key value byte after reopen for interior root split")
+	}
+	err = db.Close()
+	assert(err == nil, "close reopened db for large key interior root split")
+	assertStructuralInvariants(path)
+}
+
+func testFreeListReuse(tmpDir string) {
+	path := filepath.Join([]string{tmpDir, "free_list_reuse.vokv"})
+	db, err := vostore.Open(path)
+	assert(err == nil, "open db for free list reuse")
+
+	first := make([]byte, 5000)
+	for i := 0; i < len(first); i++ {
+		first[i] = byte((i * 3) % 251)
+	}
+	second := make([]byte, 5000)
+	for i := 0; i < len(second); i++ {
+		second[i] = byte((i * 5) % 241)
+	}
+
+	err = db.SetBytes("big", first)
+	assert(err == nil, "set first value for free list reuse")
+	err = db.Close()
+	assert(err == nil, "close db after first value for free list reuse")
+
+	db, err = vostore.Open(path)
+	assert(err == nil, "reopen db for delete in free list reuse")
+	found, err := db.Delete("big")
+	assert(err == nil, "delete value for free list reuse")
+	assert(found, "delete should find existing value for free list reuse")
+	err = db.Close()
+	assert(err == nil, "close db after delete for free list reuse")
+
+	pageCountAfterDelete, freeCountAfterDelete := readPrimaryHeaderCounts(path)
+	assert(freeCountAfterDelete >= 3, "delete should populate free list")
+
+	db, err = vostore.Open(path)
+	assert(err == nil, "reopen db for reinsertion in free list reuse")
+	err = db.SetBytes("again", second)
+	assert(err == nil, "set second value for free list reuse")
+	err = db.Close()
+	assert(err == nil, "close db after second value for free list reuse")
+
+	pageCountAfterReuse, freeCountAfterReuse := readPrimaryHeaderCounts(path)
+	assert(pageCountAfterReuse == pageCountAfterDelete, "page reuse should avoid growing pageCount")
+	assert(freeCountAfterReuse < freeCountAfterDelete, "page reuse should consume free pages")
+
+	db, err = vostore.Open(path)
+	assert(err == nil, "reopen db to verify reused value")
+	got, ok, err := db.GetBytes("again")
+	assert(err == nil, "get reused value err")
+	assert(ok, "get reused value found")
+	assert(len(got) == len(second), "reused value length")
+	for i := 0; i < len(got); i++ {
+		assert(got[i] == second[i], "reused value byte mismatch")
+	}
+	err = db.Close()
+	assert(err == nil, "close db after verifying reused value")
+}
+
+func testPendingFreeRecovery(tmpDir string) {
+	path := filepath.Join([]string{tmpDir, "pending_free_recovery.vokv"})
+	db, err := vostore.Open(path)
+	assert(err == nil, "open db for pending free recovery")
+
+	first := make([]byte, 5000)
+	for i := 0; i < len(first); i++ {
+		first[i] = byte((i * 7) % 251)
+	}
+	second := make([]byte, 5000)
+	for i := 0; i < len(second); i++ {
+		second[i] = byte((i * 11) % 241)
+	}
+
+	err = db.SetBytes("big", first)
+	assert(err == nil, "set first value for pending free recovery")
+	err = db.Close()
+	assert(err == nil, "close db after first value for pending free recovery")
+
+	db, err = vostore.Open(path)
+	assert(err == nil, "reopen db for delete in pending free recovery")
+	found, err := db.Delete("big")
+	assert(err == nil, "delete value for pending free recovery")
+	assert(found, "delete should find existing key for pending free recovery")
+	err = db.Close()
+	assert(err == nil, "close db after delete for pending free recovery")
+
+	pageCountAfterDelete, freeHeadAfterDelete, freeCountAfterDelete, pendingHeadAfterDelete, pendingCountAfterDelete := readPrimaryHeaderState(path)
+	assert(freeCountAfterDelete >= 3, "delete should create reusable pages for pending free recovery")
+	assert(pendingHeadAfterDelete == 0, "pending free head should be clear before synthetic recovery")
+	assert(pendingCountAfterDelete == 0, "pending free count should be clear before synthetic recovery")
+
+	pendingHead := freeHeadAfterDelete
+	headPage := readPageBytes(path, pendingHead)
+	if headPage[0] == 3 {
+		freeIDs := readFreeListIDs(path, freeHeadAfterDelete, freeCountAfterDelete)
+		assert(len(freeIDs) == int(freeCountAfterDelete), "free list ids count before synthetic pending recovery")
+		pendingIDs := make([]uint32, len(freeIDs)-1)
+		for i := 1; i < len(freeIDs); i++ {
+			pendingIDs[i-1] = freeIDs[i]
+		}
+		err = writePageBytes(path, pendingHead, marshalTestPendingPage(0, pendingIDs))
+		assert(err == nil, "rewrite pending page for pending free recovery")
+	} else {
+		assert(headPage[0] == 5, "pending free recovery head page type")
+	}
+
+	buf := readHeaderBytes(path)
+	binary.LittleEndian.PutUint32(buf[testOffFreeHead:], 0)
+	binary.LittleEndian.PutUint32(buf[testOffFreeCount:], 0)
+	binary.LittleEndian.PutUint32(buf[testOffPendingFreeHead:], pendingHead)
+	binary.LittleEndian.PutUint32(buf[testOffPendingFreeCount:], freeCountAfterDelete)
+	rewriteHeaderChecksum(buf[:testHeaderSize])
+	binary.LittleEndian.PutUint32(buf[testHeaderSize+testOffFreeHead:], 0)
+	binary.LittleEndian.PutUint32(buf[testHeaderSize+testOffFreeCount:], 0)
+	binary.LittleEndian.PutUint32(buf[testHeaderSize+testOffPendingFreeHead:], pendingHead)
+	binary.LittleEndian.PutUint32(buf[testHeaderSize+testOffPendingFreeCount:], freeCountAfterDelete)
+	rewriteHeaderChecksum(buf[testHeaderSize:testHeaderTotal])
+	err = writeHeaderBytes(path, buf)
+	assert(err == nil, "rewrite header into pending state for pending free recovery")
+
+	db, err = vostore.Open(path)
+	assert(err == nil, "open db from synthetic pending state")
+	_, ok, err := db.GetBytes("big")
+	assert(err == nil, "get deleted key after pending free recovery")
+	assert(!ok, "deleted key should stay deleted after pending free recovery")
+	pageCountRecovered, freeHeadRecovered, freeCountRecovered, pendingHeadRecovered, pendingCountRecovered := readPrimaryHeaderState(path)
+	assert(pageCountRecovered == pageCountAfterDelete, "page count should remain stable after pending free recovery")
+	assert(freeHeadRecovered != 0, "free head should be restored after pending free recovery")
+	assert(freeCountRecovered == freeCountAfterDelete, "free count should be restored after pending free recovery")
+	assert(pendingHeadRecovered == 0, "pending free head should be cleared after pending free recovery")
+	assert(pendingCountRecovered == 0, "pending free count should be cleared after pending free recovery")
+
+	err = db.SetBytes("again", second)
+	assert(err == nil, "set second value after pending free recovery")
+	err = db.Close()
+	assert(err == nil, "close db after reuse in pending free recovery")
+
+	pageCountAfterReuse, _, freeCountAfterReuse, pendingHeadAfterReuse, pendingCountAfterReuse := readPrimaryHeaderState(path)
+	assert(pageCountAfterReuse == pageCountAfterDelete, "pending free recovery should preserve page reuse")
+	assert(freeCountAfterReuse < freeCountRecovered, "pending free recovery should consume free pages on reuse")
+	assert(pendingHeadAfterReuse == 0, "pending free head should stay clear after reuse")
+	assert(pendingCountAfterReuse == 0, "pending free count should stay clear after reuse")
+	assertStructuralInvariants(path)
+
+	db, err = vostore.Open(path)
+	assert(err == nil, "reopen db to verify pending free recovery value")
+	got, ok, err := db.GetBytes("again")
+	assert(err == nil, "get reused value after pending free recovery")
+	assert(ok, "reused value should exist after pending free recovery")
+	assert(len(got) == len(second), "reused value length after pending free recovery")
+	for i := 0; i < len(got); i++ {
+		assert(got[i] == second[i], "reused value byte after pending free recovery")
+	}
+	err = db.Close()
+	assert(err == nil, "close db after verifying pending free recovery")
+	assertStructuralInvariants(path)
+}
+
+func testOverflowCycleDetected(tmpDir string) {
+	path := filepath.Join([]string{tmpDir, "overflow_cycle_detected.vokv"})
+	db, err := vostore.Open(path)
+	assert(err == nil, "open db for overflow cycle detected")
+
+	large := make([]byte, 5000)
+	for i := 0; i < len(large); i++ {
+		large[i] = byte((i * 7) % 251)
+	}
+	err = db.SetBytes("big", large)
+	assert(err == nil, "set large value for overflow cycle detected")
+	err = db.Close()
+	assert(err == nil, "close db for overflow cycle detected")
+
+	overflowID := readSingleLeafOverflowID(path)
+	page := readPageBytes(path, overflowID)
+	binary.LittleEndian.PutUint32(page[4:8], overflowID)
+	err = writePageBytes(path, overflowID, page)
+	assert(err == nil, "rewrite overflow page into a cycle")
+
+	db, err = vostore.Open(path)
+	assert(err == nil, "reopen db for overflow cycle detected")
+	_, _, err = db.GetBytes("big")
+	assert(err != nil, "overflow cycle should fail on read")
+	err = db.Close()
+	assert(err == nil, "close db for overflow cycle detected")
+}
+
+func testModelRandomOps(tmpDir string) {
+	path := filepath.Join([]string{tmpDir, "model_random_ops.vokv"})
+	db, err := vostore.Open(path)
+	assert(err == nil, "open db for model random ops")
+
+	for seed := uint32(1); seed <= 4; seed++ {
+		model := make(map[string]string)
+		state := seed
+		err = db.Clear()
+		assert(err == nil, "clear before model random seed")
+
+		for step := 0; step < 400; step++ {
+			state = nextTestRand(state)
+			op := int(state % 6)
+			key := testKeyForState(state)
+			value := fmt.Sprintf("value-%d-%d-%s", seed, step, key)
+
+			switch op {
+			case 0, 1:
+				err = db.Set(key, value)
+				assert(err == nil, "model random set")
+				model[key] = value
+			case 2:
+				found, deleteErr := db.Delete(key)
+				assert(deleteErr == nil, "model random delete")
+				_, existed := model[key]
+				assert(found == existed, "model random delete found parity")
+				delete(model, key)
+			case 3:
+				got, ok, getErr := db.Get(key)
+				assert(getErr == nil, "model random get")
+				expected, existed := model[key]
+				assert(ok == existed, "model random get existence parity")
+				if existed {
+					assert(got == expected, "model random get value parity")
+				}
+			case 4:
+				has, hasErr := db.Has(key)
+				assert(hasErr == nil, "model random has")
+				_, existed := model[key]
+				assert(has == existed, "model random has parity")
+			case 5:
+				if step%17 == 0 {
+					err = db.Clear()
+					assert(err == nil, "model random clear")
+					model = make(map[string]string)
+				} else {
+					batchKeyA := testKeyForState(state + 17)
+					batchKeyB := testKeyForState(state + 31)
+					batchValueA := fmt.Sprintf("batch-%d-%d-a", seed, step)
+					err = db.Update(func(tx *vostore.Tx) error {
+						tx.Set(batchKeyA, batchValueA)?
+						_, deleteErr := tx.Delete(batchKeyB)
+						deleteErr?
+						return nil
+					})
+					assert(err == nil, "model random batch update")
+					model[batchKeyA] = batchValueA
+					delete(model, batchKeyB)
+				}
+			}
+
+			assertModelMatchesStore(db, model)
+
+			if step%50 == 49 {
+				err = db.Close()
+				assert(err == nil, "close db during model random ops")
+				assertStructuralInvariants(path)
+				db, err = vostore.Open(path)
+				assert(err == nil, "reopen db during model random ops")
+				assertModelMatchesStore(db, model)
+			}
+		}
+		assertStructuralInvariants(path)
+	}
+
+	err = db.Close()
+	assert(err == nil, "close db for model random ops")
+}
+
+func testModelRandomBytesOps(tmpDir string) {
+	path := filepath.Join([]string{tmpDir, "model_random_bytes_ops.vokv"})
+	db, err := vostore.Open(path)
+	assert(err == nil, "open db for model random bytes ops")
+
+	for seed := uint32(7); seed <= 9; seed++ {
+		model := make(map[string][]byte)
+		state := seed
+		err = db.Clear()
+		assert(err == nil, "clear before model random bytes seed")
+
+		for step := 0; step < 220; step++ {
+			state = nextTestRand(state)
+			op := int(state % 7)
+			key := fmt.Sprintf("blob-%02d", int(state%23))
+			value := testBytesForState(seed, step, state)
+
+			switch op {
+			case 0, 1, 2:
+				err = db.SetBytes(key, value)
+				assert(err == nil, fmt.Sprintf("model random bytes set: %v", err))
+				model[key] = cloneTestBytes(value)
+			case 3:
+				found, deleteErr := db.Delete(key)
+				assert(deleteErr == nil, "model random bytes delete")
+				_, existed := model[key]
+				assert(found == existed, "model random bytes delete found parity")
+				delete(model, key)
+			case 4:
+				got, ok, getErr := db.GetBytes(key)
+				assert(getErr == nil, "model random bytes get")
+				expected, existed := model[key]
+				assert(ok == existed, "model random bytes get existence parity")
+				if existed {
+					assert(bytesEqual(got, expected), "model random bytes get value parity")
+				}
+			case 5:
+				batchKeyA := fmt.Sprintf("blob-%02d", int((state+11)%23))
+				batchKeyB := fmt.Sprintf("blob-%02d", int((state+19)%23))
+				batchValueA := testBytesForState(seed+13, step+1, state+29)
+				err = db.Update(func(tx *vostore.Tx) error {
+					tx.SetBytes(batchKeyA, batchValueA)?
+					_, deleteErr := tx.Delete(batchKeyB)
+					deleteErr?
+					return nil
+				})
+				assert(err == nil, "model random bytes batch update")
+				model[batchKeyA] = cloneTestBytes(batchValueA)
+				delete(model, batchKeyB)
+			case 6:
+				if step%19 == 0 {
+					err = db.Clear()
+					assert(err == nil, "model random bytes clear")
+					model = make(map[string][]byte)
+				} else {
+					has, hasErr := db.Has(key)
+					assert(hasErr == nil, "model random bytes has")
+					_, existed := model[key]
+					assert(has == existed, "model random bytes has parity")
+				}
+			}
+
+			assertModelBytesMatchesStore(db, model)
+
+			if step%40 == 39 {
+				err = db.Close()
+				assert(err == nil, "close db during model random bytes ops")
+				assertStructuralInvariants(path)
+				db, err = vostore.Open(path)
+				assert(err == nil, "reopen db during model random bytes ops")
+				assertModelBytesMatchesStore(db, model)
+			}
+		}
+		assertStructuralInvariants(path)
+	}
+
+	err = db.Close()
+	assert(err == nil, "close db for model random bytes ops")
+}
+
+func testTransactionCleanupOnPanic(tmpDir string) {
+	path := filepath.Join([]string{tmpDir, "tx_cleanup_panic.vokv"})
+	db, err := vostore.Open(path)
+	assert(err == nil, "open db for tx cleanup on panic")
+
+	panicValue, didPanic := capturePanic(func() {
+		db.Update(func(tx *vostore.Tx) error {
+			tx.Set("during-panic", "value")?
+			panic("update panic")
+		})
+	})
+	assert(didPanic, "update panic should propagate")
+	assert(panicValue.(string) == "update panic", "update panic value should be preserved")
+
+	_, ok, err := db.Get("during-panic")
+	assert(err == nil, "get value after panicking update err")
+	assert(!ok, "panicking update must rollback")
+	err = db.Set("after-update-panic", "ok")
+	assert(err == nil, "store should remain usable after update panic")
+
+	panicValue, didPanic = capturePanic(func() {
+		db.View(func(tx *vostore.Tx) error {
+			_, _, err := tx.Get("after-update-panic")
+			assert(err == nil, "read inside panic view")
+			panic("view panic")
+		})
+	})
+	assert(didPanic, "view panic should propagate")
+	assert(panicValue.(string) == "view panic", "view panic value should be preserved")
+
+	err = db.Set("after-view-panic", "still-ok")
+	assert(err == nil, "store should remain usable after view panic")
+	val, ok, err := db.Get("after-view-panic")
+	assert(err == nil, "get value after view panic err")
+	assert(ok, "value after view panic should exist")
+	assert(val == "still-ok", "value after view panic")
+
+	err = db.Close()
+	assert(err == nil, "close db for tx cleanup on panic")
+}
+
+// padNum converts an int to a zero-padded string of given width.
+func padNum(n, width int) string {
+	s := fmt.Sprintf("%d", n)
+	for len(s) < width {
+		s = "0" + s
+	}
+	return s
+}
+
+const (
+	testHeaderSize = 64
+	testHeaderTotal = 128
+	testOffPageSize = 8
+	testOffRootPage = 16
+	testOffFreeHead = 20
+	testOffPageCount = 12
+	testOffFreeCount = 24
+	testOffPendingFreeHead = 28
+	testOffPendingFreeCount = 32
+	testOffTxID = 36
+	testOffChecksum = 40
+)
+
+func capturePanic(fn func()) (any, bool) {
+	var recovered any
+	var didPanic bool
+	func() {
+		defer func() {
+			recovered = recover()
+			didPanic = recovered != nil
+		}()
+		fn()
+	}()
+	return recovered, didPanic
+}
+
+func readHeaderBytes(path string) []byte {
+	buf, err := os.ReadFile(path)
+	assert(err == nil, "read header bytes")
+	assert(len(buf) >= testHeaderTotal, "header bytes length")
+	result := make([]byte, testHeaderTotal)
+	copy(result, buf[:testHeaderTotal])
+	return result
+}
+
+func writeHeaderBytes(path string, header []byte) error {
+	buf := os.ReadFile(path)?
+	if len(buf) < testHeaderTotal {
+		return fmt.Errorf("header bytes length")
+	}
+	copy(buf[:testHeaderTotal], header)
+	return os.WriteFile(path, buf, 0644)
+}
+
+func readPrimaryHeaderCounts(path string) (uint32, uint32) {
+	buf := readHeaderBytes(path)
+	pageCount := binary.LittleEndian.Uint32(buf[testOffPageCount:])
+	freeCount := binary.LittleEndian.Uint32(buf[testOffFreeCount:])
+	return pageCount, freeCount
+}
+
+func readPrimaryHeaderState(path string) (uint32, uint32, uint32, uint32, uint32) {
+	buf := readHeaderBytes(path)
+	pageCount := binary.LittleEndian.Uint32(buf[testOffPageCount:])
+	freeHead := binary.LittleEndian.Uint32(buf[testOffFreeHead:])
+	freeCount := binary.LittleEndian.Uint32(buf[testOffFreeCount:])
+	pendingFreeHead := binary.LittleEndian.Uint32(buf[testOffPendingFreeHead:])
+	pendingFreeCount := binary.LittleEndian.Uint32(buf[testOffPendingFreeCount:])
+	return pageCount, freeHead, freeCount, pendingFreeHead, pendingFreeCount
+}
+
+func readPrimaryRootPage(path string) uint32 {
+	buf := readHeaderBytes(path)
+	return binary.LittleEndian.Uint32(buf[testOffRootPage:])
+}
+
+func readPageBytes(path string, pageID uint32) []byte {
+	buf, err := os.ReadFile(path)
+	assert(err == nil, "read page bytes")
+	offset := int(pageID) * 4096
+	assert(len(buf) >= offset+4096, "page bytes length")
+	result := make([]byte, 4096)
+	copy(result, buf[offset:offset+4096])
+	return result
+}
+
+func writePageBytes(path string, pageID uint32, page []byte) error {
+	buf := os.ReadFile(path)?
+	offset := int(pageID) * 4096
+	if len(buf) < offset+4096 {
+		return fmt.Errorf("page bytes length")
+	}
+	copy(buf[offset:offset+4096], page)
+	return os.WriteFile(path, buf, 0644)
+}
+
+func readFreeListIDs(path string, head uint32, count uint32) []uint32 {
+	ids := make([]uint32, 0, count)
+	current := head
+	for current != 0 {
+		ids = append(ids, current)
+		page := readPageBytes(path, current)
+		if page[0] == 3 {
+			current = binary.LittleEndian.Uint32(page[4:8])
+			continue
+		}
+		assert(page[0] == 5, "free list ids page type")
+		entryCount := int(binary.LittleEndian.Uint16(page[8:10]))
+		assert(10+entryCount*4 <= 4096, "free list ids pending payload bounds")
+		pos := 10
+		for i := 0; i < entryCount; i++ {
+			id := binary.LittleEndian.Uint32(page[pos : pos+4])
+			assert(id != 0, "free list ids pending entry")
+			ids = append(ids, id)
+			pos += 4
+		}
+		current = binary.LittleEndian.Uint32(page[4:8])
+	}
+	return ids
+}
+
+func marshalTestPendingPage(next uint32, ids []uint32) []byte {
+	buf := make([]byte, 4096)
+	buf[0] = 5
+	binary.LittleEndian.PutUint32(buf[4:], next)
+	binary.LittleEndian.PutUint16(buf[8:], uint16(len(ids)))
+	pos := 10
+	for _, id := range ids {
+		binary.LittleEndian.PutUint32(buf[pos:], id)
+		pos += 4
+	}
+	return buf
+}
+
+func testHugeKey(last byte) string {
+	buf := make([]byte, 4000)
+	for i := 0; i < len(buf)-1; i++ {
+		buf[i] = 'k'
+	}
+	buf[len(buf)-1] = last
+	return string(buf)
+}
+
+func readSingleLeafOverflowID(path string) uint32 {
+	rootPage := readPrimaryRootPage(path)
+	page := readPageBytes(path, rootPage)
+	cellCount := int(binary.LittleEndian.Uint16(page[2:4]))
+	assert(cellCount == 1, "single leaf overflow cell count")
+	offset := int(binary.LittleEndian.Uint16(page[12:14]))
+	assert(offset >= 12 && offset < 4096, "single leaf overflow offset")
+	keyLen := int(binary.LittleEndian.Uint16(page[offset : offset+2]))
+	rawValLen := binary.LittleEndian.Uint32(page[offset+2 : offset+6])
+	assert(rawValLen&0x80000000 != 0, "single leaf should store overflow pointer")
+	overflowPos := offset + 6 + keyLen
+	assert(overflowPos+4 <= 4096, "single leaf overflow pointer bounds")
+	return binary.LittleEndian.Uint32(page[overflowPos : overflowPos+4])
+}
+
+func nextTestRand(state uint32) uint32 {
+	return state*1664525 + 1013904223
+}
+
+func testKeyForState(state uint32) string {
+	return fmt.Sprintf("key-%02d", int(state%37))
+}
+
+func assertModelMatchesStore(db *vostore.Store, model map[string]string) {
+	n, err := db.Len()
+	assert(err == nil, "model parity len err")
+	assert(n == len(model), "model parity len")
+
+	keys, err := db.Keys("")
+	assert(err == nil, "model parity keys err")
+	expectedKeys := sortedModelKeys(model)
+	assert(len(keys) == len(expectedKeys), "model parity keys count")
+	for i := 0; i < len(keys); i++ {
+		assert(keys[i] == expectedKeys[i], "model parity key order")
+		value, ok, getErr := db.Get(keys[i])
+		assert(getErr == nil, "model parity key get err")
+		assert(ok, "model parity key should exist")
+		assert(value == model[keys[i]], "model parity key value")
+	}
+
+	for key, expected := range model {
+		value, ok, getErr := db.Get(key)
+		assert(getErr == nil, "model parity direct get err")
+		assert(ok, "model parity direct get exists")
+		assert(value == expected, "model parity direct get value")
+		has, hasErr := db.Has(key)
+		assert(hasErr == nil, "model parity direct has err")
+		assert(has, "model parity direct has exists")
+	}
+
+	missingKey := "key-missing"
+	_, exists := model[missingKey]
+	assert(!exists, "model parity missing key assumption")
+	_, ok, getErr := db.Get(missingKey)
+	assert(getErr == nil, "model parity missing get err")
+	assert(!ok, "model parity missing get")
+	has, hasErr := db.Has(missingKey)
+	assert(hasErr == nil, "model parity missing has err")
+	assert(!has, "model parity missing has")
+
+	for prefixDigit := 0; prefixDigit < 4; prefixDigit++ {
+		prefix := fmt.Sprintf("key-%1d", prefixDigit)
+		prefixKeys, prefixErr := db.Keys(prefix)
+		assert(prefixErr == nil, "model parity prefix keys err")
+		expectedPrefixKeys := filteredModelKeys(model, prefix)
+		assert(len(prefixKeys) == len(expectedPrefixKeys), "model parity prefix keys count")
+		for i := 0; i < len(prefixKeys); i++ {
+			assert(prefixKeys[i] == expectedPrefixKeys[i], "model parity prefix key order")
+		}
+	}
+}
+
+func sortedModelKeys(model map[string]string) []string {
+	keys := make([]string, 0, len(model))
+	for key := range model {
+		keys = append(keys, key)
+	}
+	for i := 1; i < len(keys); i++ {
+		j := i
+		for j > 0 && keys[j] < keys[j-1] {
+			keys[j], keys[j-1] = keys[j-1], keys[j]
+			j--
+		}
+	}
+	return keys
+}
+
+func filteredModelKeys(model map[string]string, prefix string) []string {
+	keys := make([]string, 0)
+	for key := range model {
+		if len(key) >= len(prefix) && key[:len(prefix)] == prefix {
+			keys = append(keys, key)
+		}
+	}
+	for i := 1; i < len(keys); i++ {
+		j := i
+		for j > 0 && keys[j] < keys[j-1] {
+			keys[j], keys[j-1] = keys[j-1], keys[j]
+			j--
+		}
+	}
+	return keys
+}
+
+func assertStructuralInvariants(path string) {
+	buf := readHeaderBytes(path)
+	pageCount := binary.LittleEndian.Uint32(buf[testOffPageCount:])
+	rootPage := binary.LittleEndian.Uint32(buf[testOffRootPage:])
+	freeHead := binary.LittleEndian.Uint32(buf[testOffFreeHead:])
+	freeCount := binary.LittleEndian.Uint32(buf[testOffFreeCount:])
+	pendingFreeHead := binary.LittleEndian.Uint32(buf[testOffPendingFreeHead:])
+	pendingFreeCount := binary.LittleEndian.Uint32(buf[testOffPendingFreeCount:])
+	fileBuf, err := os.ReadFile(path)
+	assert(err == nil, "structural invariant read file")
+	assert(len(fileBuf) == int(pageCount)*4096, "structural invariant file size")
+	assert(pendingFreeHead == 0, "structural invariant pending free head cleared")
+	assert(pendingFreeCount == 0, "structural invariant pending free count cleared")
+
+	treePages := make(map[uint32]bool)
+	overflowPages := make(map[uint32]bool)
+	freePages := make(map[uint32]bool)
+
+	if rootPage != 0 {
+		collectTreePages(path, rootPage, treePages, overflowPages)
+		collectFirstKeyAndValidateSeparators(path, rootPage, make(map[uint32]bool))
+	}
+	collectFreePages(path, freeHead, freePages)
+	assert(uint32(len(freePages)) == freeCount, "structural invariant free count matches free list")
+
+	for pageID := range treePages {
+		assert(!overflowPages[pageID], "structural invariant tree/overflow disjoint")
+		assert(!freePages[pageID], "structural invariant tree/free disjoint")
+	}
+	for pageID := range overflowPages {
+		assert(!freePages[pageID], "structural invariant overflow/free disjoint")
+	}
+
+	for pageID := uint32(1); pageID < pageCount; pageID++ {
+		assert(treePages[pageID] || overflowPages[pageID] || freePages[pageID], "structural invariant page coverage")
+	}
+}
+
+func collectFirstKeyAndValidateSeparators(path string, pageID uint32, seen map[uint32]bool) string {
+	assert(pageID != 0, "separator invariant page id")
+	assert(!seen[pageID], "separator invariant btree cycle")
+	seen[pageID] = true
+	page := readPageBytes(path, pageID)
+	pageType := page[0]
+	cellCount := int(binary.LittleEndian.Uint16(page[2:4]))
+	assert(cellCount >= 0, "separator invariant cell count")
+	if pageType == 1 {
+		assert(cellCount > 0, "separator invariant leaf must be non-empty")
+		return pageFirstKey(page)
+	}
+	assert(pageType == 2, "separator invariant interior page type")
+	rightChild := binary.LittleEndian.Uint32(page[4:8])
+	assert(rightChild != 0, "separator invariant interior right child")
+	if cellCount == 0 {
+		return collectFirstKeyAndValidateSeparators(path, rightChild, seen)
+	}
+	childFirstKeys := make([]string, cellCount+1)
+	for i := 0; i < cellCount; i++ {
+		off := int(binary.LittleEndian.Uint16(page[12+i*2 : 14+i*2]))
+		childPage := binary.LittleEndian.Uint32(page[off : off+4])
+		childFirstKeys[i] = collectFirstKeyAndValidateSeparators(path, childPage, seen)
+	}
+	childFirstKeys[cellCount] = collectFirstKeyAndValidateSeparators(path, rightChild, seen)
+	for i := 0; i < cellCount; i++ {
+		off := int(binary.LittleEndian.Uint16(page[12+i*2 : 14+i*2]))
+		keyLen := int(binary.LittleEndian.Uint16(page[off+4 : off+6]))
+		sepKey := string(page[off+6 : off+6+keyLen])
+		assert(sepKey == childFirstKeys[i+1], "separator invariant matches right child first key")
+	}
+	return childFirstKeys[0]
+}
+
+func pageFirstKey(page []byte) string {
+	cellCount := int(binary.LittleEndian.Uint16(page[2:4]))
+	assert(cellCount > 0, "page first key requires non-empty page")
+	off := int(binary.LittleEndian.Uint16(page[12:14]))
+	keyLen := int(binary.LittleEndian.Uint16(page[off : off+2]))
+	return string(page[off+6 : off+6+keyLen])
+}
+
+func collectTreePages(path string, pageID uint32, treePages map[uint32]bool, overflowPages map[uint32]bool) {
+	if pageID == 0 {
+		return
+	}
+	assert(!treePages[pageID], "structural invariant btree cycle")
+	treePages[pageID] = true
+	page := readPageBytes(path, pageID)
+	pageType := page[0]
+	assert(pageType == 1 || pageType == 2, "structural invariant node page type")
+	cellCount := int(binary.LittleEndian.Uint16(page[2:4]))
+	offsetEnd := 12 + cellCount*2
+	assert(offsetEnd <= 4096, "structural invariant offset table fits")
+	for i := 0; i < cellCount; i++ {
+		off := int(binary.LittleEndian.Uint16(page[12+i*2 : 14+i*2]))
+		assert(off >= offsetEnd && off < 4096, "structural invariant cell offset bounds")
+		if pageType == 1 {
+			assert(off+6 <= 4096, "structural invariant leaf header bounds")
+			keyLen := int(binary.LittleEndian.Uint16(page[off : off+2]))
+			rawValLen := binary.LittleEndian.Uint32(page[off+2 : off+6])
+			pos := off + 6 + keyLen
+			assert(pos <= 4096, "structural invariant leaf key bounds")
+			if rawValLen&0x80000000 != 0 {
+				assert(pos+4 <= 4096, "structural invariant overflow pointer bounds")
+				overflowID := binary.LittleEndian.Uint32(page[pos : pos+4])
+				collectOverflowPages(path, overflowID, overflowPages)
+			} else {
+				valLen := int(rawValLen)
+				assert(pos+valLen <= 4096, "structural invariant inline value bounds")
+			}
+		} else {
+			assert(off+6 <= 4096, "structural invariant interior header bounds")
+			childPage := binary.LittleEndian.Uint32(page[off : off+4])
+			keyLen := int(binary.LittleEndian.Uint16(page[off+4 : off+6]))
+			assert(off+6+keyLen <= 4096, "structural invariant interior key bounds")
+			collectTreePages(path, childPage, treePages, overflowPages)
+		}
+	}
+	if pageType == 1 {
+		assert(binary.LittleEndian.Uint32(page[4:8]) == 0, "structural invariant leaf right child must be zero")
+	}
+	if pageType == 2 {
+		rightChild := binary.LittleEndian.Uint32(page[4:8])
+		assert(rightChild != 0, "structural invariant interior right child")
+		collectTreePages(path, rightChild, treePages, overflowPages)
+	}
+}
+
+func collectOverflowPages(path string, pageID uint32, overflowPages map[uint32]bool) {
+	current := pageID
+	for current != 0 {
+		assert(!overflowPages[current], "structural invariant overflow cycle")
+		overflowPages[current] = true
+		page := readPageBytes(path, current)
+		assert(page[0] == 4, "structural invariant overflow page type")
+		dataLen := int(binary.LittleEndian.Uint16(page[8:10]))
+		assert(10+dataLen <= 4096, "structural invariant overflow length")
+		current = binary.LittleEndian.Uint32(page[4:8])
+	}
+}
+
+func collectFreePages(path string, pageID uint32, freePages map[uint32]bool) {
+	current := pageID
+	for current != 0 {
+		assert(!freePages[current], "structural invariant free list cycle")
+		freePages[current] = true
+		page := readPageBytes(path, current)
+		if page[0] == 3 {
+			current = binary.LittleEndian.Uint32(page[4:8])
+			continue
+		}
+		assert(page[0] == 5, "structural invariant free list page type")
+		count := int(binary.LittleEndian.Uint16(page[8:10]))
+		assert(10+count*4 <= 4096, "structural invariant pending free payload bounds")
+		pos := 10
+		for i := 0; i < count; i++ {
+			id := binary.LittleEndian.Uint32(page[pos : pos+4])
+			assert(id != 0, "structural invariant pending free page id")
+			assert(!freePages[id], "structural invariant pending free duplicate page")
+			freePages[id] = true
+			pos += 4
+		}
+		current = binary.LittleEndian.Uint32(page[4:8])
+	}
+}
+
+func assertModelBytesMatchesStore(db *vostore.Store, model map[string][]byte) {
+	n, err := db.Len()
+	assert(err == nil, "model bytes parity len err")
+	assert(n == len(model), "model bytes parity len")
+
+	keys, err := db.Keys("")
+	assert(err == nil, "model bytes parity keys err")
+	expectedKeys := sortedModelKeysBytes(model)
+	assert(len(keys) == len(expectedKeys), "model bytes parity keys count")
+	for i := 0; i < len(keys); i++ {
+		assert(keys[i] == expectedKeys[i], "model bytes parity key order")
+		value, ok, getErr := db.GetBytes(keys[i])
+		assert(getErr == nil, "model bytes parity key get err")
+		assert(ok, "model bytes parity key should exist")
+		assert(bytesEqual(value, model[keys[i]]), "model bytes parity key value")
+	}
+
+	for key, expected := range model {
+		value, ok, getErr := db.GetBytes(key)
+		assert(getErr == nil, "model bytes parity direct get err")
+		assert(ok, "model bytes parity direct get exists")
+		assert(bytesEqual(value, expected), "model bytes parity direct get value")
+		has, hasErr := db.Has(key)
+		assert(hasErr == nil, "model bytes parity direct has err")
+		assert(has, "model bytes parity direct has exists")
+	}
+
+	missingKey := "blob-missing"
+	_, exists := model[missingKey]
+	assert(!exists, "model bytes parity missing key assumption")
+	_, ok, getErr := db.GetBytes(missingKey)
+	assert(getErr == nil, "model bytes parity missing get err")
+	assert(!ok, "model bytes parity missing get")
+	has, hasErr := db.Has(missingKey)
+	assert(hasErr == nil, "model bytes parity missing has err")
+	assert(!has, "model bytes parity missing has")
+
+	for prefixDigit := 0; prefixDigit < 3; prefixDigit++ {
+		prefix := fmt.Sprintf("blob-%1d", prefixDigit)
+		prefixKeys, prefixErr := db.Keys(prefix)
+		assert(prefixErr == nil, "model bytes parity prefix keys err")
+		expectedPrefixKeys := filteredModelKeysBytes(model, prefix)
+		assert(len(prefixKeys) == len(expectedPrefixKeys), "model bytes parity prefix keys count")
+		for i := 0; i < len(prefixKeys); i++ {
+			assert(prefixKeys[i] == expectedPrefixKeys[i], "model bytes parity prefix key order")
+		}
+	}
+}
+
+func sortedModelKeysBytes(model map[string][]byte) []string {
+	keys := make([]string, 0, len(model))
+	for key := range model {
+		keys = append(keys, key)
+	}
+	for i := 1; i < len(keys); i++ {
+		j := i
+		for j > 0 && keys[j] < keys[j-1] {
+			keys[j], keys[j-1] = keys[j-1], keys[j]
+			j--
+		}
+	}
+	return keys
+}
+
+func filteredModelKeysBytes(model map[string][]byte, prefix string) []string {
+	keys := make([]string, 0)
+	for key := range model {
+		if len(key) >= len(prefix) && key[:len(prefix)] == prefix {
+			keys = append(keys, key)
+		}
+	}
+	for i := 1; i < len(keys); i++ {
+		j := i
+		for j > 0 && keys[j] < keys[j-1] {
+			keys[j], keys[j-1] = keys[j-1], keys[j]
+			j--
+		}
+	}
+	return keys
+}
+
+func cloneTestBytes(src []byte) []byte {
+	if src == nil {
+		return nil
+	}
+	dst := make([]byte, len(src))
+	copy(dst, src)
+	return dst
+}
+
+func bytesEqual(a, b []byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := 0; i < len(a); i++ {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func testBytesForState(seed uint32, step int, state uint32) []byte {
+	length := int(state%5000) + 1
+	if step%7 == 0 {
+		length = 4300 + int(state%1400)
+	}
+	if step%11 == 0 {
+		length = 16 + int(state%96)
+	}
+	data := make([]byte, length)
+	base := state + seed*97 + uint32(step)*13
+	for i := 0; i < len(data); i++ {
+		data[i] = byte((base + uint32(i)*17 + uint32(i/7)*29) % 251)
+	}
+	return data
+}
+
+func rewriteHeaderChecksum(buf []byte) {
+	binary.LittleEndian.PutUint32(buf[testOffChecksum:], testCRC32(buf[:testOffChecksum]))
+}
+
+func testCRC32(data []byte) uint32 {
+	crc := uint32(0xFFFFFFFF)
+	for _, b := range data {
+		crc ^= uint32(b)
+		for i := 0; i < 8; i++ {
+			if crc&1 != 0 {
+				crc = (crc >> 1) ^ 0xEDB88320
+			} else {
+				crc >>= 1
+			}
+		}
+	}
+	return crc ^ 0xFFFFFFFF
+}

@@ -1,0 +1,193 @@
+// Package vostore provides a persistent key-value store backed by a B+tree.
+//
+// It is implemented in pure Vo, using os.File for I/O, so it works
+// cross-platform on both native and WASM (via Vo's VFS layer).
+//
+// Features:
+//   - B+tree with page-based storage (4KB pages)
+//   - Copy-on-write header commit for crash safety
+//   - Overflow pages for large values (>3800 bytes)
+//   - Free page recycling
+//   - Ordered key iteration and prefix scanning
+//
+// Usage:
+//
+//   db, err := vostore.Open("mydata.vokv")
+//   if err != nil { ... }
+//   defer db.Close()
+//
+//   db.Set("user:1:name", "Alice")?
+//   name, found, err := db.Get("user:1:name")
+//   db.Delete("user:1:name")?
+//   keys, err := db.Keys("user:1:")
+package vostore
+
+import (
+	"encoding/json"
+	"os"
+	"path/filepath"
+)
+
+// Store is a persistent key-value store backed by a B+tree on disk.
+type Store struct {
+	tree *btree
+}
+
+// Open opens or creates a vostore database at the given path.
+// The file is created if it does not exist.
+// The parent directory is created if needed.
+func Open(path string) (*Store, error) {
+	os.MkdirAll(filepath.Dir(path), 0755)?
+	pgr := openPager(path)?
+	return &Store{
+		tree: &btree{pager: pgr},
+	}, nil
+}
+
+// Get retrieves the value for a key.
+// Returns (value, true, nil) if found, ("", false, nil) if not found.
+// Returns a non-nil error only on I/O or corruption failures.
+func (s *Store) Get(key string) (string, bool, error) {
+	var value string
+	var found bool
+	err := s.View(func(tx *Tx) error {
+		var getErr error
+		value, found, getErr = tx.Get(key)
+		return getErr
+	})
+	return value, found, err
+}
+
+// GetBytes retrieves the raw value for a key.
+// Returns (value, true, nil) if found, (nil, false, nil) if not found.
+func (s *Store) GetBytes(key string) ([]byte, bool, error) {
+	var value []byte
+	var found bool
+	err := s.View(func(tx *Tx) error {
+		var getErr error
+		value, found, getErr = tx.GetBytes(key)
+		return getErr
+	})
+	return value, found, err
+}
+
+// Set stores a key-value pair. Overwrites any existing value.
+// Commits to disk immediately.
+func (s *Store) Set(key, value string) error {
+	return s.Update(func(tx *Tx) error {
+		return tx.Set(key, value)
+	})
+}
+
+// SetBytes stores a key with a raw byte value. Commits to disk immediately.
+func (s *Store) SetBytes(key string, value []byte) error {
+	return s.Update(func(tx *Tx) error {
+		return tx.SetBytes(key, value)
+	})
+}
+
+// Delete removes a key. Returns true if the key existed.
+// Commits to disk immediately.
+func (s *Store) Delete(key string) (bool, error) {
+	var found bool
+	err := s.Update(func(tx *Tx) error {
+		var deleteErr error
+		found, deleteErr = tx.Delete(key)
+		return deleteErr
+	})
+	return found, err
+}
+
+// Has returns whether the key exists in the store.
+func (s *Store) Has(key string) (bool, error) {
+	var found bool
+	err := s.View(func(tx *Tx) error {
+		var hasErr error
+		found, hasErr = tx.Has(key)
+		return hasErr
+	})
+	return found, err
+}
+
+// Keys returns all keys with the given prefix, in sorted order.
+// If prefix is empty, returns all keys.
+func (s *Store) Keys(prefix string) ([]string, error) {
+	var keys []string
+	err := s.View(func(tx *Tx) error {
+		var keysErr error
+		keys, keysErr = tx.Keys(prefix)
+		return keysErr
+	})
+	return keys, err
+}
+
+// Len returns the total number of key-value pairs in the store.
+func (s *Store) Len() (int, error) {
+	var n int
+	err := s.View(func(tx *Tx) error {
+		var lenErr error
+		n, lenErr = tx.Len()
+		return lenErr
+	})
+	return n, err
+}
+
+// Clear removes all key-value pairs from the store.
+// This recreates the database file from scratch.
+func (s *Store) Clear() error {
+	return s.Update(func(tx *Tx) error {
+		return tx.Clear()
+	})
+}
+
+// Close commits any pending changes and closes the database file.
+func (s *Store) Close() error {
+	return s.tree.pager.close()
+}
+
+// Update performs multiple operations in a single atomic write transaction.
+func (s *Store) Update(fn func(tx *Tx) error) (err error) {
+	tx := s.beginTx(true)?
+	defer func() {
+		if r := recover(); r != nil {
+			tx.rollback()
+			panic(r)
+		}
+		if !tx.closed {
+			tx.rollback()
+		}
+	}()
+	err = fn(tx)
+	if err != nil {
+		return err
+	}
+	err = tx.commit()
+	return err
+}
+
+// View executes a read-only transaction against a stable snapshot.
+func (s *Store) View(fn func(tx *Tx) error) (err error) {
+	tx := s.beginTx(false)?
+	defer func() {
+		if r := recover(); r != nil {
+			tx.rollback()
+			panic(r)
+		}
+		tx.rollback()
+	}()
+	err = fn(tx)
+	return err
+}
+
+// GetJSON retrieves a JSON-encoded value and unmarshals it into v.
+func (s *Store) GetJSON(key string, v any) error {
+	return s.View(func(tx *Tx) error {
+		return tx.GetJSON(key, v)
+	})
+}
+
+// SetJSON marshals v as JSON and stores it under key.
+func (s *Store) SetJSON(key string, v any) error {
+	data := json.Marshal(v)?
+	return s.SetBytes(key, data)
+}

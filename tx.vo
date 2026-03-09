@@ -1,0 +1,125 @@
+package vostore
+
+import (
+	"encoding/json"
+	"errors"
+)
+
+type Tx struct {
+	store    *Store
+	tree     *btree
+	writable bool
+	closed   bool
+}
+
+func (s *Store) beginTx(writable bool) (*Tx, error) {
+	s.tree.pager.beginTx(writable)?
+	return &Tx{
+		store:    s,
+		tree:     &btree{pager: s.tree.pager},
+		writable: writable,
+	}, nil
+}
+
+func (tx *Tx) ensureOpen() error {
+	if tx.closed {
+		return errors.New("vostore: transaction is closed")
+	}
+	return nil
+}
+
+func (tx *Tx) ensureWritable() error {
+	tx.ensureOpen()?
+	if !tx.writable {
+		return errors.New("vostore: transaction is read-only")
+	}
+	return nil
+}
+
+func (tx *Tx) commit() error {
+	tx.ensureOpen()?
+	tx.store.tree.pager.commit()?
+	tx.closed = true
+	return nil
+}
+
+func (tx *Tx) rollback() {
+	if tx.closed {
+		return
+	}
+	tx.store.tree.pager.rollback()
+	tx.closed = true
+}
+
+func (tx *Tx) Get(key string) (string, bool, error) {
+	tx.ensureOpen()?
+	result := tx.tree.search([]byte(key))?
+	if !result.found {
+		return "", false, nil
+	}
+	return string(result.value), true, nil
+}
+
+func (tx *Tx) GetBytes(key string) ([]byte, bool, error) {
+	tx.ensureOpen()?
+	result := tx.tree.search([]byte(key))?
+	if !result.found {
+		return nil, false, nil
+	}
+	return cloneBytes(result.value), true, nil
+}
+
+func (tx *Tx) Set(key, value string) error {
+	tx.ensureWritable()?
+	return tx.tree.insert([]byte(key), []byte(value))
+}
+
+func (tx *Tx) SetBytes(key string, value []byte) error {
+	tx.ensureWritable()?
+	return tx.tree.insert([]byte(key), value)
+}
+
+func (tx *Tx) Delete(key string) (bool, error) {
+	tx.ensureWritable()?
+	return tx.tree.delete([]byte(key))
+}
+
+func (tx *Tx) Has(key string) (bool, error) {
+	tx.ensureOpen()?
+	result := tx.tree.search([]byte(key))?
+	return result.found, nil
+}
+
+func (tx *Tx) Keys(prefix string) ([]string, error) {
+	tx.ensureOpen()?
+	if prefix == "" {
+		return tx.tree.allKeys()
+	}
+	return tx.tree.keysWithPrefix([]byte(prefix))
+}
+
+func (tx *Tx) Len() (int, error) {
+	tx.ensureOpen()?
+	return tx.tree.count()
+}
+
+func (tx *Tx) Clear() error {
+	tx.ensureWritable()?
+	return tx.store.tree.pager.reset()
+}
+
+func (tx *Tx) GetJSON(key string, v any) error {
+	data, found, err := tx.GetBytes(key)
+	if err != nil {
+		return err
+	}
+	if !found {
+		return errors.New("vostore: key not found: " + key)
+	}
+	return json.Unmarshal(data, v)
+}
+
+func (tx *Tx) SetJSON(key string, v any) error {
+	data := json.Marshal(v)?
+	return tx.SetBytes(key, data)
+}

@@ -1,0 +1,146 @@
+package vostore
+
+import (
+	"encoding/binary"
+	"errors"
+)
+
+const (
+	headerMagic   = "VOKV"
+	headerVersion = 1
+	headerSize    = 64
+	headerTotal   = 128 // primary + shadow
+	pageSize      = 4096
+
+	offMagic            = 0
+	offVersion          = 4
+	offPageSize         = 8
+	offPageCount        = 12
+	offRootPage         = 16
+	offFreeHead         = 20
+	offFreeCount        = 24
+	offPendingFreeHead  = 28
+	offPendingFreeCount = 32
+	offTxID             = 36
+	offChecksum         = 40
+)
+
+type header struct {
+	pageSize         uint32
+	pageCount        uint32
+	rootPage         uint32
+	freeHead         uint32
+	freeCount        uint32
+	pendingFreeHead  uint32
+	pendingFreeCount uint32
+	txID             uint32
+}
+
+func newHeader() header {
+	return header{
+		pageSize:         pageSize,
+		pageCount:        1,
+		rootPage:         0,
+		freeHead:         0,
+		freeCount:        0,
+		pendingFreeHead:  0,
+		pendingFreeCount: 0,
+		txID:             0,
+	}
+}
+
+func marshalHeader(h header) []byte {
+	buf := make([]byte, headerSize)
+	copy(buf[offMagic:], []byte(headerMagic))
+	buf[offVersion] = headerVersion
+	binary.LittleEndian.PutUint32(buf[offPageSize:], h.pageSize)
+	binary.LittleEndian.PutUint32(buf[offPageCount:], h.pageCount)
+	binary.LittleEndian.PutUint32(buf[offRootPage:], h.rootPage)
+	binary.LittleEndian.PutUint32(buf[offFreeHead:], h.freeHead)
+	binary.LittleEndian.PutUint32(buf[offFreeCount:], h.freeCount)
+	binary.LittleEndian.PutUint32(buf[offPendingFreeHead:], h.pendingFreeHead)
+	binary.LittleEndian.PutUint32(buf[offPendingFreeCount:], h.pendingFreeCount)
+	binary.LittleEndian.PutUint32(buf[offTxID:], h.txID)
+	binary.LittleEndian.PutUint32(buf[offChecksum:], crc32(buf[:offChecksum]))
+	return buf
+}
+
+func unmarshalHeader(buf []byte) (header, error) {
+	if len(buf) < headerSize {
+		return header{}, errors.New("vostore: header too short")
+	}
+	if string(buf[offMagic:offMagic+4]) != headerMagic {
+		return header{}, errors.New("vostore: invalid magic")
+	}
+	if buf[offVersion] != headerVersion {
+		return header{}, errors.New("vostore: unsupported version")
+	}
+	stored := binary.LittleEndian.Uint32(buf[offChecksum:])
+	computed := crc32(buf[:offChecksum])
+	if stored != computed {
+		return header{}, errors.New("vostore: header checksum mismatch")
+	}
+	return header{
+		pageSize:         binary.LittleEndian.Uint32(buf[offPageSize:]),
+		pageCount:        binary.LittleEndian.Uint32(buf[offPageCount:]),
+		rootPage:         binary.LittleEndian.Uint32(buf[offRootPage:]),
+		freeHead:         binary.LittleEndian.Uint32(buf[offFreeHead:]),
+		freeCount:        binary.LittleEndian.Uint32(buf[offFreeCount:]),
+		pendingFreeHead:  binary.LittleEndian.Uint32(buf[offPendingFreeHead:]),
+		pendingFreeCount: binary.LittleEndian.Uint32(buf[offPendingFreeCount:]),
+		txID:             binary.LittleEndian.Uint32(buf[offTxID:]),
+	}, nil
+}
+
+func validateHeader(h header, fileSize int64) error {
+	if h.pageSize != pageSize {
+		return errors.New("vostore: unsupported page size")
+	}
+	if h.pageCount < 1 {
+		return errors.New("vostore: invalid page count")
+	}
+	expectedSize := int64(h.pageCount) * int64(pageSize)
+	if fileSize < expectedSize {
+		return errors.New("vostore: file size is smaller than header")
+	}
+	if fileSize%int64(pageSize) != 0 {
+		return errors.New("vostore: file size is not page aligned")
+	}
+	if h.rootPage != 0 && h.rootPage >= h.pageCount {
+		return errors.New("vostore: root page out of bounds")
+	}
+	if h.freeCount >= h.pageCount {
+		return errors.New("vostore: free page count out of bounds")
+	}
+	if h.pendingFreeCount >= h.pageCount {
+		return errors.New("vostore: pending free page count out of bounds")
+	}
+	if h.freeHead != 0 && h.freeHead >= h.pageCount {
+		return errors.New("vostore: free list head out of bounds")
+	}
+	if h.pendingFreeHead != 0 && h.pendingFreeHead >= h.pageCount {
+		return errors.New("vostore: pending free list head out of bounds")
+	}
+	if (h.freeHead == 0) != (h.freeCount == 0) {
+		return errors.New("vostore: inconsistent free list header")
+	}
+	if (h.pendingFreeHead == 0) != (h.pendingFreeCount == 0) {
+		return errors.New("vostore: inconsistent pending free list header")
+	}
+	return nil
+}
+
+func crc32(data []byte) uint32 {
+	var crc uint32 = 0xFFFFFFFF
+	for _, b := range data {
+		crc ^= uint32(b)
+		for i := 0; i < 8; i++ {
+			if crc&1 != 0 {
+				crc = (crc >> 1) ^ 0xEDB88320
+			} else {
+				crc >>= 1
+			}
+		}
+	}
+	return crc ^ 0xFFFFFFFF
+}

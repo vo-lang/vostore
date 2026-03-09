@@ -1,0 +1,286 @@
+// Page layout for B-tree nodes.
+//
+// Each page is 4096 bytes. Page 0 is reserved for the file header.
+// B-tree pages start from page 1.
+//
+// Page types:
+//   pageTypeLeaf     = 1  — leaf node, stores key-value pairs
+//   pageTypeInterior = 2  — interior node, stores keys and child page pointers
+//   pageTypeFree     = 3  — free page, stores next-free pointer
+//   pageTypeOverflow = 4  — overflow page for large values
+//
+// Page header (12 bytes):
+//   [0..1)   pageType    uint8
+//   [1..2)   reserved    uint8
+//   [2..4)   cellCount   uint16  (number of cells in this page)
+//   [4..8)   rightChild  uint32  — Leaf rightChild is reserved (always zero on disk); interior: rightmost child
+//   [8..12)  reserved    4 bytes (zero, future use)
+//
+// Cell layout — Leaf:
+//   keyLen(2) + valLen(4) + key(keyLen) + val(valLen)
+//   If valLen > maxInlineValue, val stores an overflow page number (4 bytes).
+//
+// Cell layout — Interior:
+//   childPage(4) + keyLen(2) + key(keyLen)
+//   The child page is the left child for keys < this cell's key.
+//
+// Cells are stored in sorted order by key within the page.
+// Cell offsets are stored as a uint16 array right after the page header.
+// Offset array: [12 .. 12 + cellCount*2)
+// Cell data grows downward from the end of the page.
+//
+// Free page layout:
+//   [0..1)   pageType = 3
+//   [4..8)   nextFree uint32 (next free page number, 0 = end of list)
+package vostore
+
+import (
+	"encoding/binary"
+	"errors"
+)
+
+const (
+	pageTypeLeaf     = 1
+	pageTypeInterior = 2
+	pageTypeFree     = 3
+	pageTypeOverflow = 4
+	pageTypePending  = 5
+
+	pageHeaderSize   = 12
+	cellOffsetSize   = 2
+	maxInlineValue   = 3800 // values larger than this go to overflow pages
+
+	// leaf cell: keyLen(2) + valLen(4) + key + val
+	leafCellOverhead = 6
+	// interior cell: childPage(4) + keyLen(2) + key
+	interiorCellOverhead = 6
+)
+
+// page is the in-memory representation of a B-tree page.
+type page struct {
+	id        uint32
+	pageType  uint8
+	dirty     bool
+	cellCount uint16
+	rightChild uint32  // interior: rightmost child; leaf: reserved (always 0)
+	cells     []cell
+}
+
+// cell represents a single entry in a page.
+type cell struct {
+	key        []byte
+	value      []byte  // leaf only
+	childPage  uint32  // interior only: left child pointer
+	overflowID uint32  // leaf only: overflow page if value is external
+}
+
+// cellSize returns the serialized size of a cell.
+func cellSize(c cell, isLeaf bool) int {
+	if isLeaf {
+		vlen := len(c.value)
+		if c.overflowID != 0 {
+			vlen = 4 // overflow pointer
+		}
+		return leafCellOverhead + len(c.key) + vlen
+	}
+	return interiorCellOverhead + len(c.key)
+}
+
+// pageUsedSpace returns total bytes used by cells + offset array + header.
+func pageUsedSpace(p page) int {
+	isLeaf := p.pageType == pageTypeLeaf
+	used := pageHeaderSize + int(p.cellCount)*cellOffsetSize
+	for _, c := range p.cells {
+		used += cellSize(c, isLeaf)
+	}
+	return used
+}
+
+// pageFreeSpace returns available bytes for new cells.
+func pageFreeSpace(p page) int {
+	free := pageSize - pageUsedSpace(p)
+	if free < 0 {
+		return 0
+	}
+	return free
+}
+
+// marshalPage serializes a page into a 4096-byte buffer.
+func marshalPage(p page) []byte {
+	buf := make([]byte, pageSize)
+	buf[0] = p.pageType
+	binary.LittleEndian.PutUint16(buf[2:], p.cellCount)
+	binary.LittleEndian.PutUint32(buf[4:], p.rightChild)
+
+	isLeaf := p.pageType == pageTypeLeaf
+	// Cell data grows downward from end of page.
+	dataEnd := pageSize
+	offsetBase := pageHeaderSize
+
+	for i := 0; i < int(p.cellCount); i++ {
+		c := p.cells[i]
+		size := cellSize(c, isLeaf)
+		dataEnd -= size
+		// Write cell offset
+		binary.LittleEndian.PutUint16(buf[offsetBase+i*cellOffsetSize:], uint16(dataEnd))
+		// Write cell data
+		pos := dataEnd
+		if isLeaf {
+			binary.LittleEndian.PutUint16(buf[pos:], uint16(len(c.key)))
+			pos += 2
+			if c.overflowID != 0 {
+				binary.LittleEndian.PutUint32(buf[pos:], uint32(len(c.value)) | 0x80000000)
+				pos += 4
+				copy(buf[pos:], c.key)
+				pos += len(c.key)
+				binary.LittleEndian.PutUint32(buf[pos:], c.overflowID)
+			} else {
+				binary.LittleEndian.PutUint32(buf[pos:], uint32(len(c.value)))
+				pos += 4
+				copy(buf[pos:], c.key)
+				pos += len(c.key)
+				copy(buf[pos:], c.value)
+			}
+		} else {
+			binary.LittleEndian.PutUint32(buf[pos:], c.childPage)
+			pos += 4
+			binary.LittleEndian.PutUint16(buf[pos:], uint16(len(c.key)))
+			pos += 2
+			copy(buf[pos:], c.key)
+		}
+	}
+	return buf
+}
+
+// unmarshalPage deserializes a 4096-byte buffer into a page.
+// Returns an error if any field is out of bounds, preventing panics on corrupt data.
+func unmarshalPage(buf []byte, id uint32) (page, error) {
+	if len(buf) < pageHeaderSize {
+		return page{}, errors.New("vostore: page buffer too short")
+	}
+	p := page{
+		id:         id,
+		pageType:   buf[0],
+		cellCount:  binary.LittleEndian.Uint16(buf[2:]),
+		rightChild: binary.LittleEndian.Uint32(buf[4:]),
+	}
+
+	switch p.pageType {
+	case pageTypeLeaf, pageTypeInterior:
+		// parsed below
+	case pageTypeFree, pageTypeOverflow, pageTypePending:
+		return p, nil
+	default:
+		return page{}, errors.New("vostore: corrupt page: unknown page type")
+	}
+
+	isLeaf := p.pageType == pageTypeLeaf
+	offsetEnd := pageHeaderSize + int(p.cellCount)*cellOffsetSize
+	if offsetEnd > pageSize {
+		return page{}, errors.New("vostore: corrupt page: cellCount overflows offset array")
+	}
+
+	p.cells = make([]cell, p.cellCount)
+
+	for i := 0; i < int(p.cellCount); i++ {
+		off := int(binary.LittleEndian.Uint16(buf[pageHeaderSize+i*cellOffsetSize:]))
+		if off < offsetEnd || off >= pageSize {
+			return page{}, errors.New("vostore: corrupt page: cell offset out of bounds")
+		}
+		pos := off
+		var c cell
+		if isLeaf {
+			if pos+leafCellOverhead > pageSize {
+				return page{}, errors.New("vostore: corrupt page: leaf cell header overflows")
+			}
+			keyLen := int(binary.LittleEndian.Uint16(buf[pos:]))
+			pos += 2
+			rawValLen := binary.LittleEndian.Uint32(buf[pos:])
+			pos += 4
+			hasOverflow := rawValLen&0x80000000 != 0
+			valLen := int(rawValLen & 0x7FFFFFFF)
+			if pos+keyLen > pageSize {
+				return page{}, errors.New("vostore: corrupt page: key overflows page")
+			}
+			c.key = make([]byte, keyLen)
+			copy(c.key, buf[pos:pos+keyLen])
+			pos += keyLen
+			if hasOverflow {
+				if pos+4 > pageSize {
+					return page{}, errors.New("vostore: corrupt page: overflow pointer overflows")
+				}
+				c.overflowID = binary.LittleEndian.Uint32(buf[pos:])
+			} else {
+				if pos+valLen > pageSize {
+					return page{}, errors.New("vostore: corrupt page: value overflows page")
+				}
+				c.value = make([]byte, valLen)
+				copy(c.value, buf[pos:pos+valLen])
+			}
+		} else {
+			if pos+interiorCellOverhead > pageSize {
+				return page{}, errors.New("vostore: corrupt page: interior cell header overflows")
+			}
+			c.childPage = binary.LittleEndian.Uint32(buf[pos:])
+			pos += 4
+			keyLen := int(binary.LittleEndian.Uint16(buf[pos:]))
+			pos += 2
+			if pos+keyLen > pageSize {
+				return page{}, errors.New("vostore: corrupt page: key overflows page")
+			}
+			c.key = make([]byte, keyLen)
+			copy(c.key, buf[pos:pos+keyLen])
+		}
+		p.cells[i] = c
+	}
+	return p, nil
+}
+
+// freePageNext reads the next-free pointer from a free page buffer.
+func freePageNext(buf []byte) uint32 {
+	return binary.LittleEndian.Uint32(buf[4:])
+}
+
+func freePageTarget(buf []byte) uint32 {
+	return binary.LittleEndian.Uint32(buf[8:])
+}
+
+func marshalFreePage(next, target uint32) []byte {
+	buf := make([]byte, pageSize)
+	buf[0] = pageTypeFree
+	binary.LittleEndian.PutUint32(buf[4:], next)
+	binary.LittleEndian.PutUint32(buf[8:], target)
+	return buf
+}
+
+func pendingPageNext(buf []byte) uint32 {
+	return binary.LittleEndian.Uint32(buf[4:])
+}
+
+func pendingPageCount(buf []byte) uint16 {
+	return binary.LittleEndian.Uint16(buf[8:])
+}
+
+func pendingPageIDs(buf []byte) []uint32 {
+	count := int(pendingPageCount(buf))
+	ids := make([]uint32, count)
+	pos := 10
+	for i := 0; i < count; i++ {
+		ids[i] = binary.LittleEndian.Uint32(buf[pos:])
+		pos += 4
+	}
+	return ids
+}
+
+func marshalPendingPage(next uint32, ids []uint32) []byte {
+	buf := make([]byte, pageSize)
+	buf[0] = pageTypePending
+	binary.LittleEndian.PutUint32(buf[4:], next)
+	binary.LittleEndian.PutUint16(buf[8:], uint16(len(ids)))
+	pos := 10
+	for _, id := range ids {
+		binary.LittleEndian.PutUint32(buf[pos:], id)
+		pos += 4
+	}
+	return buf
+}
