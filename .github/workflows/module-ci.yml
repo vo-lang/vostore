@@ -1,0 +1,99 @@
+name: Module CI
+
+on:
+  pull_request:
+  push:
+    branches: ["main", "master"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release tag to package"
+        required: false
+        type: string
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: module
+
+      - uses: actions/checkout@v4
+        with:
+          repository: vo-lang/volang
+          path: volang
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Verify release state
+        working-directory: volang
+        run: cargo run -p vo --release -- release verify ../module
+
+      - name: Check module
+        working-directory: volang
+        run: ./d.py --release check ../module
+
+      - name: Test module
+        working-directory: volang
+        run: |
+          if [ -d ../module/tests ]; then
+            ./d.py test both --release ../module/tests
+          else
+            echo "no tests directory"
+          fi
+
+  release_assets:
+    if: ${{ github.event_name == 'release' || github.event_name == 'workflow_dispatch' }}
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: module
+
+      - uses: actions/checkout@v4
+        with:
+          repository: vo-lang/volang
+          path: volang
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Determine release version
+        id: version
+        shell: bash
+        run: |
+          version="${{ github.event.release.tag_name }}"
+          if [ -z "$version" ]; then
+            version="${{ inputs.version }}"
+          fi
+          if [ -z "$version" ]; then
+            echo "version input is required for workflow_dispatch" >&2
+            exit 1
+          fi
+          echo "value=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Build source package and release manifest
+        working-directory: volang
+        run: |
+          rm -rf ../module/.phase6-dist
+          cargo run -p vo --release -- release stage ../module --version "${{ steps.version.outputs.value }}" --out-dir ../module/.phase6-dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-assets
+          path: module/.phase6-dist/*
+
+      - name: Upload GitHub release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ steps.version.outputs.value }}" module/.phase6-dist/* --clobber
