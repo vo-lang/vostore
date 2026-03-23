@@ -3,11 +3,11 @@ name: Module CI
 on:
   pull_request:
   push:
-    branches: ["main", "master"]
+    branches: [main]
   workflow_dispatch:
     inputs:
       version:
-        description: "Release tag to package"
+        description: "Release tag (e.g. v0.1.0)"
         required: false
         type: string
   release:
@@ -53,7 +53,7 @@ jobs:
           fi
 
   release_assets:
-    if: ${{ github.event_name == 'release' || github.event_name == 'workflow_dispatch' }}
+    if: github.event_name == 'release' || github.event_name == 'workflow_dispatch'
     needs: validate
     runs-on: ubuntu-latest
     steps:
@@ -70,30 +70,28 @@ jobs:
 
       - name: Determine release version
         id: version
-        shell: bash
         run: |
-          version="${{ github.event.release.tag_name }}"
+          version="${{ github.event.release.tag_name || inputs.version }}"
           if [ -z "$version" ]; then
-            version="${{ inputs.version }}"
-          fi
-          if [ -z "$version" ]; then
-            echo "version input is required for workflow_dispatch" >&2
+            echo "::error::version is required for workflow_dispatch"
             exit 1
           fi
           echo "value=$version" >> "$GITHUB_OUTPUT"
 
-      - name: Build source package and release manifest
+      - name: Stage release assets
         working-directory: volang
         run: |
-          rm -rf ../module/.phase6-dist
-          cargo run -p vo --release -- release stage ../module --version "${{ steps.version.outputs.value }}" --out-dir ../module/.phase6-dist
+          cargo run -p vo --release -- release stage ../module \
+            --version "${{ steps.version.outputs.value }}" \
+            --out-dir ../module/release-dist
 
       - uses: actions/upload-artifact@v4
         with:
           name: release-assets
-          path: module/.phase6-dist/*
+          path: module/release-dist/
 
-      - name: Upload GitHub release assets
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh release upload "${{ steps.version.outputs.value }}" module/.phase6-dist/* --clobber
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.value }}
+          files: module/release-dist/*
