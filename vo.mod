@@ -1,3 +1,3 @@
 module github.com/vo-lang/vostore
 
-vo 0.1
+vo 0.1.0
