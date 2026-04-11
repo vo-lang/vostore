@@ -28,7 +28,7 @@ jobs:
           ref: ${{ github.event_name == 'workflow_dispatch' && inputs.version || github.event_name == 'release' && github.event.release.tag_name || github.ref }}
 
       - name: Install vo
-        run: brew install vo-lang/vo/vo
+        run: curl -fsSL "https://github.com/vo-lang/volang/releases/latest/download/vo-x86_64-unknown-linux-gnu.tar.gz" | tar -xz -C /usr/local/bin vo
 
       - name: Verify release state
         run: vo release verify .
@@ -56,7 +56,7 @@ jobs:
           ref: ${{ github.event_name == 'workflow_dispatch' && inputs.version || github.event_name == 'release' && github.event.release.tag_name || github.ref }}
 
       - name: Install vo
-        run: brew install vo-lang/vo/vo
+        run: curl -fsSL "https://github.com/vo-lang/volang/releases/latest/download/vo-x86_64-unknown-linux-gnu.tar.gz" | tar -xz -C /usr/local/bin vo
 
       - name: Stage release assets
         run: |
