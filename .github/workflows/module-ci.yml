@@ -4,6 +4,7 @@ on:
   pull_request:
   push:
     branches: [main]
+    tags: ["v*"]
   workflow_dispatch:
     inputs:
       version:
@@ -19,79 +20,52 @@ permissions:
 jobs:
   validate:
     runs-on: ubuntu-latest
+    env:
+      VOWORK: off
     steps:
       - uses: actions/checkout@v4
         with:
-          path: module
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.version || github.event_name == 'release' && github.event.release.tag_name || github.ref }}
 
-      - uses: actions/checkout@v4
-        with:
-          repository: vo-lang/volang
-          path: volang
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install vo
+        run: brew install vo-lang/vo/vo
 
       - name: Verify release state
-        working-directory: volang
-        run: cargo run -p vo --release -- release verify ../module
+        run: vo release verify .
 
       - name: Check module
-        working-directory: volang
-        run: ./d.py --release check ../module
+        run: vo check .
 
       - name: Test module
-        working-directory: volang
         run: |
-          if [ -d ../module/tests ]; then
-            ./d.py test both --release ../module/tests
+          if [ -d tests ]; then
+            vo test tests
           else
             echo "no tests directory"
           fi
 
   release_assets:
-    if: github.event_name == 'release' || github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'release' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v'))
     needs: validate
     runs-on: ubuntu-latest
+    env:
+      VOWORK: off
     steps:
       - uses: actions/checkout@v4
         with:
-          path: module
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.version || github.event_name == 'release' && github.event.release.tag_name || github.ref }}
 
-      - uses: actions/checkout@v4
-        with:
-          repository: vo-lang/volang
-          path: volang
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - name: Determine release version
-        id: version
-        run: |
-          version="${{ github.event.release.tag_name || inputs.version }}"
-          if [ -z "$version" ]; then
-            echo "::error::version is required for workflow_dispatch"
-            exit 1
-          fi
-          echo "value=$version" >> "$GITHUB_OUTPUT"
+      - name: Install vo
+        run: brew install vo-lang/vo/vo
 
       - name: Stage release assets
-        working-directory: volang
         run: |
-          cargo run -p vo --release -- release stage ../module \
-            --version "${{ steps.version.outputs.value }}" \
-            --out-dir ../module/release-dist
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: release-assets
-          path: module/release-dist/
+          vo release stage . \
+            --version "${{ inputs.version || github.event.release.tag_name || github.ref_name }}" \
+            --out-dir release-dist
 
       - name: Upload release assets
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.version.outputs.value }}
-          files: module/release-dist/*
+          tag_name: ${{ inputs.version || github.event.release.tag_name || github.ref_name }}
+          files: release-dist/*
