@@ -53,7 +53,7 @@ func main() {
 }
 
 func testBasicCRUD(tmpDir string) {
-	path := filepath.Join([]string{tmpDir, "crud.vokv"})
+	path := filepath.Join(tmpDir, "crud.vokv")
 	db, err := vostore.Open(path)
 	assert(err == nil, "open db for crud")
 
@@ -85,7 +85,7 @@ func testBasicCRUD(tmpDir string) {
 }
 
 func testGetBytesIsolation(tmpDir string) {
-	path := filepath.Join([]string{tmpDir, "getbytes_isolation.vokv"})
+	path := filepath.Join(tmpDir, "getbytes_isolation.vokv")
 	db, err := vostore.Open(path)
 	assert(err == nil, "open db for getbytes isolation")
 
@@ -110,7 +110,7 @@ func testGetBytesIsolation(tmpDir string) {
 }
 
 func testBatchOps(tmpDir string) {
-	path := filepath.Join([]string{tmpDir, "batch.vokv"})
+	path := filepath.Join(tmpDir, "batch.vokv")
 	db, err := vostore.Open(path)
 	assert(err == nil, "open db for batch")
 
@@ -141,7 +141,7 @@ func testBatchOps(tmpDir string) {
 }
 
 func testBatchRollback(tmpDir string) {
-	path := filepath.Join([]string{tmpDir, "batch_rollback.vokv"})
+	path := filepath.Join(tmpDir, "batch_rollback.vokv")
 	db, err := vostore.Open(path)
 	assert(err == nil, "open db for batch rollback")
 
@@ -177,7 +177,7 @@ func testBatchRollback(tmpDir string) {
 }
 
 func testBatchOverwriteRollback(tmpDir string) {
-	path := filepath.Join([]string{tmpDir, "batch_overwrite_rollback.vokv"})
+	path := filepath.Join(tmpDir, "batch_overwrite_rollback.vokv")
 	db, err := vostore.Open(path)
 	assert(err == nil, "open db for batch overwrite rollback")
 
@@ -201,7 +201,7 @@ func testBatchOverwriteRollback(tmpDir string) {
 }
 
 func testBatchDeleteRollback(tmpDir string) {
-	path := filepath.Join([]string{tmpDir, "batch_delete_rollback.vokv"})
+	path := filepath.Join(tmpDir, "batch_delete_rollback.vokv")
 	db, err := vostore.Open(path)
 	assert(err == nil, "open db for batch delete rollback")
 
@@ -226,7 +226,7 @@ func testBatchDeleteRollback(tmpDir string) {
 }
 
 func testOverwrite(tmpDir string) {
-	path := filepath.Join([]string{tmpDir, "overwrite.vokv"})
+	path := filepath.Join(tmpDir, "overwrite.vokv")
 	db, err := vostore.Open(path)
 	assert(err == nil, "open db for overwrite")
 
@@ -246,7 +246,7 @@ func testOverwrite(tmpDir string) {
 }
 
 func testKeys(tmpDir string) {
-	path := filepath.Join([]string{tmpDir, "keys.vokv"})
+	path := filepath.Join(tmpDir, "keys.vokv")
 	db, err := vostore.Open(path)
 	assert(err == nil, "open db for keys")
 
@@ -270,7 +270,7 @@ func testKeys(tmpDir string) {
 }
 
 func testPrefixKeys(tmpDir string) {
-	path := filepath.Join([]string{tmpDir, "prefix.vokv"})
+	path := filepath.Join(tmpDir, "prefix.vokv")
 	db, err := vostore.Open(path)
 	assert(err == nil, "open db for prefix")
 
@@ -297,7 +297,7 @@ func testPrefixKeys(tmpDir string) {
 }
 
 func testLen(tmpDir string) {
-	path := filepath.Join([]string{tmpDir, "len.vokv"})
+	path := filepath.Join(tmpDir, "len.vokv")
 	db, err := vostore.Open(path)
 	assert(err == nil, "open db for len")
 
@@ -325,7 +325,7 @@ func testLen(tmpDir string) {
 }
 
 func testClear(tmpDir string) {
-	path := filepath.Join([]string{tmpDir, "clear.vokv"})
+	path := filepath.Join(tmpDir, "clear.vokv")
 	db, err := vostore.Open(path)
 	assert(err == nil, "open db for clear")
 
@@ -355,7 +355,7 @@ func testClear(tmpDir string) {
 }
 
 func testClearReopen(tmpDir string) {
-	path := filepath.Join([]string{tmpDir, "clear_reopen.vokv"})
+	path := filepath.Join(tmpDir, "clear_reopen.vokv")
 	db, err := vostore.Open(path)
 	assert(err == nil, "open db for clear reopen")
 	err = db.Set("x", "1")
@@ -381,7 +381,7 @@ func testClearReopen(tmpDir string) {
 }
 
 func testTransactionalClear(tmpDir string) {
-	path := filepath.Join([]string{tmpDir, "tx_clear.vokv"})
+	path := filepath.Join(tmpDir, "tx_clear.vokv")
 	db, err := vostore.Open(path)
 	assert(err == nil, "open db for transactional clear")
 
@@ -414,7 +414,7 @@ func testTransactionalClear(tmpDir string) {
 }
 
 func testClearRollback(tmpDir string) {
-	path := filepath.Join([]string{tmpDir, "clear_rollback.vokv"})
+	path := filepath.Join(tmpDir, "clear_rollback.vokv")
 	db, err := vostore.Open(path)
 	assert(err == nil, "open db for clear rollback")
 
@@ -438,7 +438,7 @@ func testClearRollback(tmpDir string) {
 }
 
 func testPersistence(tmpDir string) {
-	path := filepath.Join([]string{tmpDir, "persist.vokv"})
+	path := filepath.Join(tmpDir, "persist.vokv")
 
 	// Write and close
 	db, err := vostore.Open(path)
@@ -467,7 +467,7 @@ func testPersistence(tmpDir string) {
 }
 
 func testManyKeys(tmpDir string) {
-	path := filepath.Join([]string{tmpDir, "many.vokv"})
+	path := filepath.Join(tmpDir, "many.vokv")
 	db, err := vostore.Open(path)
 	assert(err == nil, "open db for many keys")
 
@@ -519,7 +519,7 @@ func testManyKeys(tmpDir string) {
 }
 
 func testDeepDeleteReinsert(tmpDir string) {
-	path := filepath.Join([]string{tmpDir, "deep_delete_reinsert.vokv"})
+	path := filepath.Join(tmpDir, "deep_delete_reinsert.vokv")
 	db, err := vostore.Open(path)
 	assert(err == nil, "open db for deep delete reinsert")
 
@@ -608,7 +608,7 @@ func testDeepDeleteReinsert(tmpDir string) {
 }
 
 func testDeleteCollapseRootAndReexpand(tmpDir string) {
-	path := filepath.Join([]string{tmpDir, "delete_collapse_root_reexpand.vokv"})
+	path := filepath.Join(tmpDir, "delete_collapse_root_reexpand.vokv")
 	db, err := vostore.Open(path)
 	assert(err == nil, "open db for delete collapse root reexpand")
 
@@ -682,7 +682,7 @@ func testDeleteCollapseRootAndReexpand(tmpDir string) {
 }
 
 func testDeleteRefreshesMiddleSeparators(tmpDir string) {
-	path := filepath.Join([]string{tmpDir, "delete_refreshes_middle_separators.vokv"})
+	path := filepath.Join(tmpDir, "delete_refreshes_middle_separators.vokv")
 	db, err := vostore.Open(path)
 	assert(err == nil, "open db for delete refreshes middle separators")
 
@@ -756,7 +756,7 @@ func testDeleteRefreshesMiddleSeparators(tmpDir string) {
 }
 
 func testDeleteNonExistent(tmpDir string) {
-	path := filepath.Join([]string{tmpDir, "delete_missing.vokv"})
+	path := filepath.Join(tmpDir, "delete_missing.vokv")
 	db, err := vostore.Open(path)
 	assert(err == nil, "open db for delete missing")
 
@@ -769,7 +769,7 @@ func testDeleteNonExistent(tmpDir string) {
 }
 
 func testEmptyStore(tmpDir string) {
-	path := filepath.Join([]string{tmpDir, "empty.vokv"})
+	path := filepath.Join(tmpDir, "empty.vokv")
 	db, err := vostore.Open(path)
 	assert(err == nil, "open empty db")
 
@@ -788,7 +788,7 @@ func testEmptyStore(tmpDir string) {
 }
 
 func testLargeValue(tmpDir string) {
-	path := filepath.Join([]string{tmpDir, "large.vokv"})
+	path := filepath.Join(tmpDir, "large.vokv")
 	db, err := vostore.Open(path)
 	assert(err == nil, "open db for large value")
 
@@ -828,7 +828,7 @@ func testLargeValue(tmpDir string) {
 }
 
 func testOverflowOverwrite(tmpDir string) {
-	path := filepath.Join([]string{tmpDir, "overflow_overwrite.vokv"})
+	path := filepath.Join(tmpDir, "overflow_overwrite.vokv")
 	db, err := vostore.Open(path)
 	assert(err == nil, "open db for overflow overwrite")
 
@@ -883,7 +883,7 @@ func testOverflowOverwrite(tmpDir string) {
 }
 
 func testOverflowDelete(tmpDir string) {
-	path := filepath.Join([]string{tmpDir, "overflow_delete.vokv"})
+	path := filepath.Join(tmpDir, "overflow_delete.vokv")
 	db, err := vostore.Open(path)
 	assert(err == nil, "open db for overflow delete")
 
@@ -931,7 +931,7 @@ func testOverflowDelete(tmpDir string) {
 }
 
 func testLargeKeyOverflow(tmpDir string) {
-	path := filepath.Join([]string{tmpDir, "large_key_overflow.vokv"})
+	path := filepath.Join(tmpDir, "large_key_overflow.vokv")
 	db, err := vostore.Open(path)
 	assert(err == nil, "open db for large key overflow")
 
@@ -974,7 +974,7 @@ func testLargeKeyOverflow(tmpDir string) {
 }
 
 func testKeyValidation(tmpDir string) {
-	path := filepath.Join([]string{tmpDir, "keyval.vokv"})
+	path := filepath.Join(tmpDir, "keyval.vokv")
 	db, err := vostore.Open(path)
 	assert(err == nil, "open db for key validation")
 
@@ -999,7 +999,7 @@ func testKeyValidation(tmpDir string) {
 }
 
 func testCorruptRootPageType(tmpDir string) {
-	path := filepath.Join([]string{tmpDir, "corrupt_root_page_type.vokv"})
+	path := filepath.Join(tmpDir, "corrupt_root_page_type.vokv")
 	db, err := vostore.Open(path)
 	assert(err == nil, "open db for corrupt root page type")
 	err = db.Set("root", "value")
@@ -1022,7 +1022,7 @@ func testCorruptRootPageType(tmpDir string) {
 }
 
 func testBtreeCycleDetected(tmpDir string) {
-	path := filepath.Join([]string{tmpDir, "btree_cycle_detected.vokv"})
+	path := filepath.Join(tmpDir, "btree_cycle_detected.vokv")
 	db, err := vostore.Open(path)
 	assert(err == nil, "open db for btree cycle detected")
 
@@ -1055,7 +1055,7 @@ func testBtreeCycleDetected(tmpDir string) {
 }
 
 func testLatestHeaderRecovery(tmpDir string) {
-	path := filepath.Join([]string{tmpDir, "latest_header_recovery.vokv"})
+	path := filepath.Join(tmpDir, "latest_header_recovery.vokv")
 	db, err := vostore.Open(path)
 	assert(err == nil, "open db for latest header recovery")
 	err = db.Set("persist", "yes")
@@ -1089,7 +1089,7 @@ func testLatestHeaderRecovery(tmpDir string) {
 }
 
 func testInvalidPageSizeHeader(tmpDir string) {
-	path := filepath.Join([]string{tmpDir, "invalid_page_size_header.vokv"})
+	path := filepath.Join(tmpDir, "invalid_page_size_header.vokv")
 	db, err := vostore.Open(path)
 	assert(err == nil, "open db for invalid page size header")
 	err = db.Set("persist", "yes")
@@ -1110,7 +1110,7 @@ func testInvalidPageSizeHeader(tmpDir string) {
 }
 
 func testLargeKeyInteriorRootSplit(tmpDir string) {
-	path := filepath.Join([]string{tmpDir, "large_key_interior_root_split.vokv"})
+	path := filepath.Join(tmpDir, "large_key_interior_root_split.vokv")
 	db, err := vostore.Open(path)
 	assert(err == nil, "open db for large key interior root split")
 
@@ -1152,7 +1152,7 @@ func testLargeKeyInteriorRootSplit(tmpDir string) {
 }
 
 func testFreeListReuse(tmpDir string) {
-	path := filepath.Join([]string{tmpDir, "free_list_reuse.vokv"})
+	path := filepath.Join(tmpDir, "free_list_reuse.vokv")
 	db, err := vostore.Open(path)
 	assert(err == nil, "open db for free list reuse")
 
@@ -1206,7 +1206,7 @@ func testFreeListReuse(tmpDir string) {
 }
 
 func testPendingFreeRecovery(tmpDir string) {
-	path := filepath.Join([]string{tmpDir, "pending_free_recovery.vokv"})
+	path := filepath.Join(tmpDir, "pending_free_recovery.vokv")
 	db, err := vostore.Open(path)
 	assert(err == nil, "open db for pending free recovery")
 
@@ -1305,7 +1305,7 @@ func testPendingFreeRecovery(tmpDir string) {
 }
 
 func testOverflowCycleDetected(tmpDir string) {
-	path := filepath.Join([]string{tmpDir, "overflow_cycle_detected.vokv"})
+	path := filepath.Join(tmpDir, "overflow_cycle_detected.vokv")
 	db, err := vostore.Open(path)
 	assert(err == nil, "open db for overflow cycle detected")
 
@@ -1333,7 +1333,7 @@ func testOverflowCycleDetected(tmpDir string) {
 }
 
 func testModelRandomOps(tmpDir string) {
-	path := filepath.Join([]string{tmpDir, "model_random_ops.vokv"})
+	path := filepath.Join(tmpDir, "model_random_ops.vokv")
 	db, err := vostore.Open(path)
 	assert(err == nil, "open db for model random ops")
 
@@ -1413,7 +1413,7 @@ func testModelRandomOps(tmpDir string) {
 }
 
 func testModelRandomBytesOps(tmpDir string) {
-	path := filepath.Join([]string{tmpDir, "model_random_bytes_ops.vokv"})
+	path := filepath.Join(tmpDir, "model_random_bytes_ops.vokv")
 	db, err := vostore.Open(path)
 	assert(err == nil, "open db for model random bytes ops")
 
@@ -1493,7 +1493,7 @@ func testModelRandomBytesOps(tmpDir string) {
 }
 
 func testTransactionCleanupOnPanic(tmpDir string) {
-	path := filepath.Join([]string{tmpDir, "tx_cleanup_panic.vokv"})
+	path := filepath.Join(tmpDir, "tx_cleanup_panic.vokv")
 	db, err := vostore.Open(path)
 	assert(err == nil, "open db for tx cleanup on panic")
 
