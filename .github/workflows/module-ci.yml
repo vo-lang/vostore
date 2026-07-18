@@ -9,26 +9,77 @@ on:
     inputs:
       version:
         description: "Release tag (e.g. v0.1.0)"
+        required: true
+        type: string
+      source_ref:
+        description: "Git ref to build from (defaults to the triggering ref)"
         required: false
         type: string
   release:
     types: [published]
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: module-ci-${{ github.event.release.tag_name || inputs.version || github.ref_name || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || (github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/')) }}
+
+env:
+  # Pin this to the first immutable SHA/tag after the package-protocol cutover.
+  VOLANG_REF: 6c67e9595c4f22f366a2935163658aef4d3fc384
 
 jobs:
   validate:
     runs-on: ubuntu-latest
+    outputs:
+      source_commit: ${{ steps.source.outputs.commit }}
+      volang_commit: ${{ steps.volang_source.outputs.commit }}
     env:
       VOWORK: off
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.version || github.event_name == 'release' && github.event.release.tag_name || github.ref }}
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.source_ref || github.event_name == 'release' && github.event.release.tag_name || github.ref }}
 
-      - name: Install vo
-        run: curl -fsSL "https://github.com/vo-lang/volang/releases/latest/download/vo-x86_64-unknown-linux-gnu.tar.gz" | tar -xz -C /usr/local/bin vo
+      - name: Resolve source commit
+        id: source
+        shell: bash
+        run: echo "commit=$(git rev-parse --verify HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Require immutable Volang toolchain for release
+        if: github.event_name == 'release' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v'))
+        shell: bash
+        env:
+          TOOLCHAIN_REF: ${{ env.VOLANG_REF }}
+        run: |
+          if [[ ! "$TOOLCHAIN_REF" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "set VOLANG_REF to the full package-protocol cutover commit before releasing" >&2
+            exit 1
+          fi
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
+        with:
+          toolchain: "1.94.0"
+
+      - name: Checkout volang toolchain
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: vo-lang/volang
+          ref: ${{ env.VOLANG_REF }}
+          path: volang
+
+      - name: Resolve Volang commit
+        id: volang_source
+        shell: bash
+        run: echo "commit=$(git -C volang rev-parse --verify HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Build vo
+        run: cargo build --locked --manifest-path volang/cmd/vo/Cargo.toml --release
+
+      - name: Expose vo on PATH
+        run: echo "$GITHUB_WORKSPACE/volang/target/release" >> "$GITHUB_PATH"
 
       - name: Verify release state
         run: vo release verify .
@@ -48,24 +99,132 @@ jobs:
     if: github.event_name == 'release' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v'))
     needs: validate
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     env:
       VOWORK: off
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.version || github.event_name == 'release' && github.event.release.tag_name || github.ref }}
+          ref: ${{ needs.validate.outputs.source_commit }}
 
-      - name: Install vo
-        run: curl -fsSL "https://github.com/vo-lang/volang/releases/latest/download/vo-x86_64-unknown-linux-gnu.tar.gz" | tar -xz -C /usr/local/bin vo
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
+        with:
+          toolchain: "1.94.0"
+
+      - name: Checkout volang toolchain
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: vo-lang/volang
+          ref: ${{ needs.validate.outputs.volang_commit }}
+          path: volang
+
+      - name: Build vo
+        run: cargo build --locked --manifest-path volang/cmd/vo/Cargo.toml --release
+
+      - name: Expose vo on PATH
+        run: echo "$GITHUB_WORKSPACE/volang/target/release" >> "$GITHUB_PATH"
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: "24"
 
       - name: Stage release assets
+        id: stage_release
+        shell: bash
+        env:
+          SOURCE_COMMIT: ${{ needs.validate.outputs.source_commit }}
         run: |
+          set -euo pipefail
+          tag="${{ inputs.version || github.event.release.tag_name || github.ref_name }}"
+          case "$tag" in
+            v*) ;;
+            *) echo "release tag must begin with v: $tag" >&2; exit 1 ;;
+          esac
+          release_version="${tag#v}"
+          source_commit="$SOURCE_COMMIT"
+          checked_out_commit="$(git rev-parse --verify HEAD)"
+          if [ "$checked_out_commit" != "$source_commit" ]; then
+            echo "release checkout is $checked_out_commit, expected $source_commit" >&2
+            exit 1
+          fi
           vo release stage . \
-            --version "${{ inputs.version || github.event.release.tag_name || github.ref_name }}" \
+            --version "$release_version" \
             --out-dir release-dist
+          node .github/scripts/verify_release_assets.mjs \
+            local release-dist "$source_commit" "$release_version"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "release_version=$release_version" >> "$GITHUB_OUTPUT"
+          echo "source_commit=$source_commit" >> "$GITHUB_OUTPUT"
 
-      - name: Upload release assets
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ inputs.version || github.event.release.tag_name || github.ref_name }}
-          files: release-dist/*
+      - name: Publish and verify immutable release assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IMMUTABLE_RELEASES_READ_TOKEN: ${{ secrets.IMMUTABLE_RELEASES_READ_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="${{ steps.stage_release.outputs.tag }}"
+          release_version="${{ steps.stage_release.outputs.release_version }}"
+          source_commit="${{ steps.stage_release.outputs.source_commit }}"
+          stage_dir=release-dist
+          view_json="$RUNNER_TEMP/github-release.json"
+
+          if [ -z "$IMMUTABLE_RELEASES_READ_TOKEN" ]; then
+            echo "IMMUTABLE_RELEASES_READ_TOKEN with Administration read permission is required" >&2
+            exit 1
+          fi
+          immutable_enabled="$(GH_TOKEN="$IMMUTABLE_RELEASES_READ_TOKEN" gh api \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2026-03-10" \
+            "repos/$GITHUB_REPOSITORY/immutable-releases" \
+            --jq '.enabled')"
+          if [ "$immutable_enabled" != true ]; then
+            echo "GitHub immutable releases must be enabled before publishing." >&2
+            exit 1
+          fi
+
+          tag_check_ref="refs/remotes/origin/vo-release-tags/$tag"
+          if git fetch origin "+refs/tags/$tag:$tag_check_ref"; then
+            tag_commit="$(git rev-parse --verify "$tag_check_ref^{commit}")"
+            if [ "$tag_commit" != "$source_commit" ]; then
+              echo "release tag $tag points to $tag_commit, expected $source_commit" >&2
+              exit 1
+            fi
+          else
+            git push origin "$source_commit:refs/tags/$tag"
+          fi
+
+          if draft="$(gh release view "$tag" --json isDraft --jq .isDraft 2>/dev/null)"; then
+            if [ "$draft" = true ]; then
+              gh release upload "$tag" "$stage_dir"/* --clobber
+              gh api \
+                -H "X-GitHub-Api-Version: 2026-03-10" \
+                "repos/$GITHUB_REPOSITORY/releases/tags/$tag" > "$view_json"
+              node .github/scripts/verify_release_assets.mjs \
+                draft "$stage_dir" "$source_commit" "$release_version" "$tag" "$view_json"
+              gh release edit "$tag" --draft=false --verify-tag --target "$source_commit"
+            fi
+          else
+            gh release create "$tag" --draft --verify-tag --target "$source_commit" --title "vostore $tag"
+            gh release upload "$tag" "$stage_dir"/*
+            gh api \
+              -H "X-GitHub-Api-Version: 2026-03-10" \
+              "repos/$GITHUB_REPOSITORY/releases/tags/$tag" > "$view_json"
+            node .github/scripts/verify_release_assets.mjs \
+              draft "$stage_dir" "$source_commit" "$release_version" "$tag" "$view_json"
+            gh release edit "$tag" --draft=false --verify-tag --target "$source_commit"
+          fi
+
+          git fetch origin "+refs/tags/$tag:$tag_check_ref"
+          tag_commit="$(git rev-parse --verify "$tag_check_ref^{commit}")"
+          if [ "$tag_commit" != "$source_commit" ]; then
+            echo "published tag $tag points to $tag_commit, expected $source_commit" >&2
+            exit 1
+          fi
+          gh api \
+            -H "X-GitHub-Api-Version: 2026-03-10" \
+            "repos/$GITHUB_REPOSITORY/releases/tags/$tag" > "$view_json"
+          node .github/scripts/verify_release_assets.mjs \
+            published "$stage_dir" "$source_commit" "$release_version" "$tag" "$view_json"
