@@ -1,2 +1,4 @@
+format = 1
 module = "github.com/vo-lang/vostore"
-vo = "^0.1.0"
+version = "0.1.0"
+vo = "0.1.0"
