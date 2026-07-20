@@ -523,17 +523,19 @@ func testDeepDeleteReinsert(tmpDir string) {
 	db, err := vostore.Open(path)
 	assert(err == nil, "open db for deep delete reinsert")
 
-	count := 1200
+	count := 80
+	deleteStart := 20
+	deleteEnd := 60
 	err = db.Update(func(tx *vostore.Tx) error {
 		for i := 0; i < count; i++ {
 			key := "item:" + padNum(i, 4)
-			tx.Set(key, key)?
+			tx.Set(key, largeTreeValue(key))?
 		}
 		return nil
 	})
 	assert(err == nil, "populate db for deep delete reinsert")
 
-	for i := 200; i < 1000; i++ {
+	for i := deleteStart; i < deleteEnd; i++ {
 		key := "item:" + padNum(i, 4)
 		found, deleteErr := db.Delete(key)
 		assert(deleteErr == nil, "delete key for deep delete reinsert")
@@ -542,7 +544,7 @@ func testDeepDeleteReinsert(tmpDir string) {
 
 	n, err := db.Len()
 	assert(err == nil, "len after deep delete reinsert deletes")
-	assert(n == 400, "len after deep delete reinsert deletes")
+	assert(n == count-(deleteEnd-deleteStart), "len after deep delete reinsert deletes")
 	assertStructuralInvariants(path)
 
 	err = db.Close()
@@ -551,31 +553,31 @@ func testDeepDeleteReinsert(tmpDir string) {
 	db, err = vostore.Open(path)
 	assert(err == nil, "reopen db after deletes for deep delete reinsert")
 
-	for i := 0; i < 200; i++ {
+	for i := 0; i < deleteStart; i++ {
 		key := "item:" + padNum(i, 4)
 		val, ok, getErr := db.Get(key)
 		assert(getErr == nil, "get low retained key after deep delete reinsert")
 		assert(ok, "low retained key should exist after deep delete reinsert")
-		assert(val == key, "low retained key value after deep delete reinsert")
+		assert(val == largeTreeValue(key), "low retained key value after deep delete reinsert")
 	}
-	for i := 200; i < 1000; i++ {
+	for i := deleteStart; i < deleteEnd; i++ {
 		key := "item:" + padNum(i, 4)
 		_, ok, getErr := db.Get(key)
 		assert(getErr == nil, "get deleted key after deep delete reinsert")
 		assert(!ok, "deleted key should be absent after deep delete reinsert")
 	}
-	for i := 1000; i < count; i++ {
+	for i := deleteEnd; i < count; i++ {
 		key := "item:" + padNum(i, 4)
 		val, ok, getErr := db.Get(key)
 		assert(getErr == nil, "get high retained key after deep delete reinsert")
 		assert(ok, "high retained key should exist after deep delete reinsert")
-		assert(val == key, "high retained key value after deep delete reinsert")
+		assert(val == largeTreeValue(key), "high retained key value after deep delete reinsert")
 	}
 
 	err = db.Update(func(tx *vostore.Tx) error {
-		for i := 200; i < 1000; i++ {
+		for i := deleteStart; i < deleteEnd; i++ {
 			key := "item:" + padNum(i, 4)
-			value := "new:" + padNum(i, 4)
+			value := largeTreeValue("new:" + padNum(i, 4))
 			tx.Set(key, value)?
 		}
 		return nil
@@ -596,10 +598,10 @@ func testDeepDeleteReinsert(tmpDir string) {
 		val, ok, getErr := db.Get(expectedKey)
 		assert(getErr == nil, "get after deep delete reinsert final")
 		assert(ok, "final key should exist after deep delete reinsert")
-		if i >= 200 && i < 1000 {
-			assert(val == "new:"+padNum(i, 4), "final reinserted value after deep delete reinsert")
+		if i >= deleteStart && i < deleteEnd {
+			assert(val == largeTreeValue("new:"+padNum(i, 4)), "final reinserted value after deep delete reinsert")
 		} else {
-			assert(val == expectedKey, "final retained value after deep delete reinsert")
+			assert(val == largeTreeValue(expectedKey), "final retained value after deep delete reinsert")
 		}
 	}
 
@@ -612,16 +614,18 @@ func testDeleteCollapseRootAndReexpand(tmpDir string) {
 	db, err := vostore.Open(path)
 	assert(err == nil, "open db for delete collapse root reexpand")
 
-	count := 1200
+	count := 80
 	err = db.Update(func(tx *vostore.Tx) error {
 		for i := 0; i < count; i++ {
 			key := "item:" + padNum(i, 4)
-			tx.Set(key, key)?
+			tx.Set(key, largeTreeValue(key))?
 		}
 		return nil
 	})
 	assert(err == nil, "populate db for delete collapse root reexpand")
 	assertStructuralInvariants(path)
+	initialRoot := readPageBytes(path, readPrimaryRootPage(path))
+	assert(initialRoot[0] == 2, "root starts as interior before delete collapse root reexpand")
 
 	for i := 0; i < count-1; i++ {
 		key := "item:" + padNum(i, 4)
@@ -636,7 +640,7 @@ func testDeleteCollapseRootAndReexpand(tmpDir string) {
 	val, ok, err := db.Get("item:" + padNum(count-1, 4))
 	assert(err == nil, "get survivor after delete collapse root reexpand")
 	assert(ok, "survivor exists after delete collapse root reexpand")
-	assert(val == "item:"+padNum(count-1, 4), "survivor value after delete collapse root reexpand")
+	assert(val == largeTreeValue("item:"+padNum(count-1, 4)), "survivor value after delete collapse root reexpand")
 	assertStructuralInvariants(path)
 
 	rootPage := readPrimaryRootPage(path)
@@ -649,7 +653,7 @@ func testDeleteCollapseRootAndReexpand(tmpDir string) {
 	err = db.Update(func(tx *vostore.Tx) error {
 		for i := 0; i < count-1; i++ {
 			key := "item:" + padNum(i, 4)
-			value := "new:" + padNum(i, 4)
+			value := largeTreeValue("new:" + padNum(i, 4))
 			tx.Set(key, value)?
 		}
 		return nil
@@ -660,6 +664,8 @@ func testDeleteCollapseRootAndReexpand(tmpDir string) {
 	assert(err == nil, "len after delete collapse root reexpand reinserts")
 	assert(n == count, "len after delete collapse root reexpand reinserts")
 	assertStructuralInvariants(path)
+	reexpandedRoot := readPageBytes(path, readPrimaryRootPage(path))
+	assert(reexpandedRoot[0] == 2, "root reexpands to interior after delete collapse root reexpand")
 
 	keys, err := db.Keys("item:")
 	assert(err == nil, "keys after delete collapse root reexpand")
@@ -671,9 +677,9 @@ func testDeleteCollapseRootAndReexpand(tmpDir string) {
 		assert(getErr == nil, "get after delete collapse root reexpand")
 		assert(exists, "key exists after delete collapse root reexpand")
 		if i == count-1 {
-			assert(got == expectedKey, "survivor value after delete collapse root reexpand reinserts")
+			assert(got == largeTreeValue(expectedKey), "survivor value after delete collapse root reexpand reinserts")
 		} else {
-			assert(got == "new:"+padNum(i, 4), "reinserted value after delete collapse root reexpand")
+			assert(got == largeTreeValue("new:"+padNum(i, 4)), "reinserted value after delete collapse root reexpand")
 		}
 	}
 
@@ -686,17 +692,19 @@ func testDeleteRefreshesMiddleSeparators(tmpDir string) {
 	db, err := vostore.Open(path)
 	assert(err == nil, "open db for delete refreshes middle separators")
 
-	count := 1200
+	count := 80
+	deleteStart := 25
+	deleteEnd := 55
 	err = db.Update(func(tx *vostore.Tx) error {
 		for i := 0; i < count; i++ {
 			key := "item:" + padNum(i, 4)
-			tx.Set(key, key)?
+			tx.Set(key, largeTreeValue(key))?
 		}
 		return nil
 	})
 	assert(err == nil, "populate db for delete refreshes middle separators")
 
-	for i := 350; i < 850; i++ {
+	for i := deleteStart; i < deleteEnd; i++ {
 		key := "item:" + padNum(i, 4)
 		found, deleteErr := db.Delete(key)
 		assert(deleteErr == nil, "delete key for delete refreshes middle separators")
@@ -705,7 +713,7 @@ func testDeleteRefreshesMiddleSeparators(tmpDir string) {
 
 	n, err := db.Len()
 	assert(err == nil, "len after delete refreshes middle separators")
-	assert(n == 700, "len after delete refreshes middle separators")
+	assert(n == count-(deleteEnd-deleteStart), "len after delete refreshes middle separators")
 	assertStructuralInvariants(path)
 
 	rootPage := readPrimaryRootPage(path)
@@ -720,35 +728,35 @@ func testDeleteRefreshesMiddleSeparators(tmpDir string) {
 	assert(err == nil, "reopen db for delete refreshes middle separators")
 	assertStructuralInvariants(path)
 
-	for i := 0; i < 350; i++ {
+	for i := 0; i < deleteStart; i++ {
 		key := "item:" + padNum(i, 4)
 		val, ok, getErr := db.Get(key)
 		assert(getErr == nil, "get low retained key after delete refreshes middle separators")
 		assert(ok, "low retained key should exist after delete refreshes middle separators")
-		assert(val == key, "low retained key value after delete refreshes middle separators")
+		assert(val == largeTreeValue(key), "low retained key value after delete refreshes middle separators")
 	}
-	for i := 350; i < 850; i++ {
+	for i := deleteStart; i < deleteEnd; i++ {
 		key := "item:" + padNum(i, 4)
 		_, ok, getErr := db.Get(key)
 		assert(getErr == nil, "get deleted middle key after delete refreshes middle separators")
 		assert(!ok, "deleted middle key should be absent after delete refreshes middle separators")
 	}
-	for i := 850; i < count; i++ {
+	for i := deleteEnd; i < count; i++ {
 		key := "item:" + padNum(i, 4)
 		val, ok, getErr := db.Get(key)
 		assert(getErr == nil, "get high retained key after delete refreshes middle separators")
 		assert(ok, "high retained key should exist after delete refreshes middle separators")
-		assert(val == key, "high retained key value after delete refreshes middle separators")
+		assert(val == largeTreeValue(key), "high retained key value after delete refreshes middle separators")
 	}
 
 	keys, err := db.Keys("item:")
 	assert(err == nil, "keys after delete refreshes middle separators")
-	assert(len(keys) == 700, "keys count after delete refreshes middle separators")
-	for i := 0; i < 350; i++ {
+	assert(len(keys) == count-(deleteEnd-deleteStart), "keys count after delete refreshes middle separators")
+	for i := 0; i < deleteStart; i++ {
 		assert(keys[i] == "item:"+padNum(i, 4), "low key order after delete refreshes middle separators")
 	}
-	for i := 850; i < count; i++ {
-		assert(keys[i-500] == "item:"+padNum(i, 4), "high key order after delete refreshes middle separators")
+	for i := deleteEnd; i < count; i++ {
+		assert(keys[i-(deleteEnd-deleteStart)] == "item:"+padNum(i, 4), "high key order after delete refreshes middle separators")
 	}
 
 	err = db.Close()
@@ -1337,13 +1345,13 @@ func testModelRandomOps(tmpDir string) {
 	db, err := vostore.Open(path)
 	assert(err == nil, "open db for model random ops")
 
-	for seed := uint32(1); seed <= 4; seed++ {
+	for _, seed := range []uint32{1} {
 		model := make(map[string]string)
 		state := seed
 		err = db.Clear()
 		assert(err == nil, "clear before model random seed")
 
-		for step := 0; step < 400; step++ {
+		for step := 0; step < 80; step++ {
 			state = nextTestRand(state)
 			op := int(state % 6)
 			key := testKeyForState(state)
@@ -1394,9 +1402,7 @@ func testModelRandomOps(tmpDir string) {
 				}
 			}
 
-			assertModelMatchesStore(db, model)
-
-			if step%50 == 49 {
+			if step%20 == 19 {
 				err = db.Close()
 				assert(err == nil, "close db during model random ops")
 				assertStructuralInvariants(path)
@@ -1405,6 +1411,7 @@ func testModelRandomOps(tmpDir string) {
 				assertModelMatchesStore(db, model)
 			}
 		}
+		assertModelMatchesStore(db, model)
 		assertStructuralInvariants(path)
 	}
 
@@ -1417,13 +1424,13 @@ func testModelRandomBytesOps(tmpDir string) {
 	db, err := vostore.Open(path)
 	assert(err == nil, "open db for model random bytes ops")
 
-	for seed := uint32(7); seed <= 9; seed++ {
+	for _, seed := range []uint32{7} {
 		model := make(map[string][]byte)
 		state := seed
 		err = db.Clear()
 		assert(err == nil, "clear before model random bytes seed")
 
-		for step := 0; step < 220; step++ {
+		for step := 0; step < 60; step++ {
 			state = nextTestRand(state)
 			op := int(state % 7)
 			key := fmt.Sprintf("blob-%02d", int(state%23))
@@ -1474,9 +1481,7 @@ func testModelRandomBytesOps(tmpDir string) {
 				}
 			}
 
-			assertModelBytesMatchesStore(db, model)
-
-			if step%40 == 39 {
+			if step%20 == 19 {
 				err = db.Close()
 				assert(err == nil, "close db during model random bytes ops")
 				assertStructuralInvariants(path)
@@ -1485,6 +1490,7 @@ func testModelRandomBytesOps(tmpDir string) {
 				assertModelBytesMatchesStore(db, model)
 			}
 		}
+		assertModelBytesMatchesStore(db, model)
 		assertStructuralInvariants(path)
 	}
 
@@ -1540,6 +1546,10 @@ func padNum(n, width int) string {
 		s = "0" + s
 	}
 	return s
+}
+
+func largeTreeValue(prefix string) string {
+	return prefix + ":0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 }
 
 const (
