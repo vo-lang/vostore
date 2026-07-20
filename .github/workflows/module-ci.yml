@@ -27,7 +27,7 @@ concurrency:
 
 env:
   # Pin this to the first immutable SHA/tag after the package-protocol cutover.
-  VOLANG_REF: 6c67e9595c4f22f366a2935163658aef4d3fc384
+  VOLANG_REF: ebe5e93d30156995b8fd289898edd13980787570
 
 jobs:
   validate:
